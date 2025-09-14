@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+pydantic-settings
+opencv-python
+numpy
+insightface
+onnxruntime
+cryptography
+pymysql
