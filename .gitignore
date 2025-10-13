@@ -2,3 +2,5 @@
 /shelf/
 #virtual environment
 /venv/
+#local setting
+.env

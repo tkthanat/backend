@@ -1,0 +1,59 @@
+CREATE DATABASE attendance_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE attendance_db;
+
+CREATE TABLE subjects (
+  subject_id INT AUTO_INCREMENT PRIMARY KEY,
+  subject_name VARCHAR(255) NOT NULL,
+  section VARCHAR(100),
+  schedule VARCHAR(255),
+  UNIQUE KEY uq_subject (subject_name, section)
+);
+
+CREATE TABLE users (
+  user_id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(255) NOT NULL,
+  role ENUM('admin','operator','viewer') NOT NULL,
+  password_hash VARCHAR(255),
+  embeddings_enc LONGBLOB,
+  subject_id INT,
+  is_deleted TINYINT(1) DEFAULT 0,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (subject_id) REFERENCES subjects(subject_id) ON DELETE SET NULL,
+  INDEX idx_user_subject (subject_id)
+);
+
+CREATE TABLE attendance_logs (
+  log_id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT,
+  subject_id INT,
+  action ENUM('enter','exit') NOT NULL,
+  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+  camera_id VARCHAR(50) NOT NULL,
+  flags JSON,
+  confidence FLOAT,
+  FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE SET NULL,
+  FOREIGN KEY (subject_id) REFERENCES subjects(subject_id) ON DELETE SET NULL,
+  INDEX idx_attendance_timestamp (timestamp),
+  INDEX idx_attendance_subject (subject_id)
+);
+
+CREATE TABLE alerts (
+  alert_id INT AUTO_INCREMENT PRIMARY KEY,
+  log_id INT NOT NULL,
+  type ENUM('short_stay','multiple_faces','low_confidence','spoofing') NOT NULL,
+  confidence FLOAT,
+  status ENUM('open','approved','rejected') DEFAULT 'open',
+  FOREIGN KEY (log_id) REFERENCES attendance_logs(log_id) ON DELETE CASCADE,
+  INDEX idx_alerts_status (status)
+);
+
+CREATE TABLE audit_logs (
+  audit_id INT AUTO_INCREMENT PRIMARY KEY,
+  table_name VARCHAR(50) NOT NULL,
+  action VARCHAR(50) NOT NULL,
+  record_id INT,
+  user_actor VARCHAR(255),
+  changes JSON,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
