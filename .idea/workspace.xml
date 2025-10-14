@@ -5,23 +5,17 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="7101c128-21ac-47f9-8bca-f126f73dfa0c" name="Changes" comment="#--&gt; get start">
-      <change afterPath="$PROJECT_DIR$/.env" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/app/__init__.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/app/ai_engine.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/app/camera_handler.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/app/config.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/app/db_models.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/app/main.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/app/schemas.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/app/security.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/app/utils.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/schema" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/scripts/seed_demo.sql" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/test_db_connection.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.env" beforeDir="false" afterPath="$PROJECT_DIR$/.env" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/app/ai_engine.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/ai_engine.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/app/camera_handler.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/camera_handler.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/app/db_models.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/db_models.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/app/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/main.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/schema" beforeDir="false" afterPath="$PROJECT_DIR$/schema" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/scripts/seed_demo.sql" beforeDir="false" afterPath="$PROJECT_DIR$/scripts/seed_demo.sql" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/test_db_connection.py" beforeDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -57,7 +51,7 @@
     &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
     &quot;SHARE_PROJECT_CONFIGURATION_FILES&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;alpha&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;alphaA&quot;,
     &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
     &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
     &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
@@ -71,8 +65,9 @@
 }</component>
   <component name="RecentsManager">
     <key name="MoveFile.RECENT_KEYS">
-      <recent name="C:\Users\Victus\IdeaProjects\faceAttendance" />
       <recent name="C:\Users\Victus\IdeaProjects\faceAttendance\scripts" />
+      <recent name="C:\Users\Victus\IdeaProjects\faceAttendance\app\scripts" />
+      <recent name="C:\Users\Victus\IdeaProjects\faceAttendance" />
     </key>
   </component>
   <component name="RunManager">
@@ -194,6 +189,9 @@
       <workItem from="1760264686788" duration="830000" />
       <workItem from="1760272416858" duration="1647000" />
       <workItem from="1760278574516" duration="1134000" />
+      <workItem from="1760385214679" duration="9708000" />
+      <workItem from="1760395504607" duration="1020000" />
+      <workItem from="1760413017757" duration="814000" />
     </task>
     <option name="localTasksCounter" value="2" />
     <servers />
