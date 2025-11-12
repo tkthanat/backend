@@ -8,6 +8,8 @@ from glob import glob
 from typing import Dict, Optional, List, Any, Set
 from dataclasses import dataclass, field
 
+import numpy as np
+
 from .ai_engine import annotate_and_match
 
 
@@ -30,8 +32,6 @@ class CameraSource:
     _ai_thread: Optional[threading.Thread] = field(default=None, repr=False)
     last_ai_result: List[Dict[str, Any]] = field(default_factory=list)
     is_ai_paused: bool = True
-
-    # ✨ [ใหม่] เพิ่ม Lock สำหรับป้องกัน Deadlock เวลาเปิด/ปิดกล้อง
     cap_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
@@ -63,7 +63,6 @@ class CameraManager:
         cam = self.sources.get(cam_id)
         if not cam: raise KeyError(f"camera '{cam_id}' not found")
 
-        # ✨ [แก้ไข] ใช้ Lock ป้องกันการเปิดซ้อน
         with cam.cap_lock:
             if cam.is_open: return
 
@@ -93,7 +92,6 @@ class CameraManager:
         cam = self.sources.get(cam_id)
         if not cam: return
 
-        # ✨ [แก้ไข] ใช้ Lock ป้องกันการปิดซ้อน
         with cam.cap_lock:
             if not cam.is_open: return
 
@@ -108,13 +106,9 @@ class CameraManager:
 
             if cam._thread and cam._thread.is_alive():
                 cam._thread.join(timeout=1.0)
-                if cam._thread.is_alive():
-                    print(f"[WARN] Stream worker {cam.cam_id} failed to join.")
 
             if cam._ai_thread and cam._ai_thread.is_alive():
                 cam._ai_thread.join(timeout=1.0)
-                if cam._ai_thread.is_alive():
-                    print(f"[WARN] AI worker {cam.cam_id} failed to join.")
 
             if cam.cap:
                 try:
@@ -134,17 +128,15 @@ class CameraManager:
             print(f"[CameraManager] Successfully closed camera {cam_id}")
 
     def _loop_stream(self, cam: CameraSource):
-        """Loop 1: สตรีมภาพดิบ (เร็ว)"""
         print(f"[Stream Worker {cam.cam_id}] Started...")
         while not cam._stop:
             start_time = time.time()
 
             frame = None
             try:
-                # ✨ [แก้ไข] ใช้ Lock เวลาอ่านเฟรม
                 with cam.cap_lock:
                     if not cam.is_open or not cam.cap or not cam.cap.isOpened():
-                        break  # (ถ้ากล้องถูกปิดจากภายนอก ให้ออกจาก Loop)
+                        break
                     ok, frame = cam.cap.read()
 
                 if not ok or frame is None:
@@ -167,14 +159,13 @@ class CameraManager:
 
             except Exception as e:
                 print(f"[Stream Worker {cam.cam_id}] Loop Error: {e}")
-                if cam._stop:  # (ถ้า Loop พังเพราะกำลังปิด)
+                if cam._stop:
                     break
                 time.sleep(0.5)
 
         print(f"[Stream Worker {cam.cam_id}] Stopped.")
 
     def _loop_ai(self, cam: CameraSource):
-        """Loop 2: ประมวลผล AI (ช้า) + Logic การเช็คชื่อ"""
         print(f"[AI Worker {cam.cam_id}] Started...")
 
         trackers = self.attendance_trackers.setdefault(cam.cam_id, {})
@@ -184,6 +175,7 @@ class CameraManager:
 
         while not cam._stop:
             try:
+                # (frame คือรูปภาพที่ดึงมาจาก Queue)
                 frame = cam.ai_queue.get(timeout=1.0)
                 if frame is None:
                     break
@@ -210,8 +202,6 @@ class CameraManager:
 
                         if name not in trackers:
                             trackers[name] = current_time
-                            print(
-                                f"👀 [AI Tracker] '{name}' seen on {cam.cam_id}. Starting {self.CHECK_IN_DURATION}s timer...")
                         else:
                             duration = current_time - trackers[name]
                             if duration >= self.CHECK_IN_DURATION:
@@ -219,7 +209,9 @@ class CameraManager:
                                 check_in_data = {
                                     "user_id": user_id, "name": name,
                                     "action": current_action, "timestamp": current_time,
-                                    "confidence": res.get("similarity")
+                                    "confidence": res.get("similarity"),
+                                    # ✨ [แก้ไข] เพิ่ม frame เข้าไปใน event ด้วย!
+                                    "frame": frame
                                 }
                                 self.check_in_queue.put(check_in_data)
                                 print(f"✅ [ATTENDANCE] Checked in: {name} (Action: {current_action})")
@@ -227,7 +219,6 @@ class CameraManager:
 
                 lost_names = set(trackers.keys()) - seen_in_frame
                 for name in lost_names:
-                    print(f"❌ [AI Tracker] '{name}' lost on {cam.cam_id}. Resetting timer.")
                     trackers.pop(name, None)
 
             except queue.Empty:
@@ -260,23 +251,16 @@ class CameraManager:
     def list(self):
         return [{"cam_id": c.cam_id, "src": c.src, "is_open": c.is_open} for c in self.sources.values()]
 
-    # ✨✨✨ [ แก้ไขฟังก์ชันนี้ ] ✨✨✨
     def reconfigure(self, new_sources: Dict[str, str]):
-        """
-        อัปเดต sources และปิดเฉพาะกล้องที่มีการเปลี่ยนแปลง 'src'
-        """
         print(f"Reconfiguring... New sources: {new_sources}")
         for cam_id, new_src in new_sources.items():
             if cam_id in self.sources:
                 cam = self.sources[cam_id]
-                # ถ้า src ไม่เหมือนเดิม หรือ กล้องปิดอยู่ ให้ปิดและอัปเดต
                 if cam.src != new_src or not cam.is_open:
                     print(f"Source changed for {cam_id}: {cam.src} -> {new_src}. Reconnecting...")
-                    self.close(cam_id)  # ปิดกล้องตัวนี้
-                    cam.src = new_src  # อัปเดต src ใหม่
-                # (ถ้า src เหมือนเดิมและเปิดอยู่ ก็ไม่ต้องทำอะไร)
+                    self.close(cam_id)
+                    cam.src = new_src
             else:
-                # (ถ้าเป็น cam_id ใหม่)
                 self.sources[cam_id] = CameraSource(cam_id, new_src)
 
         print(f"Reconfigure complete. Current sources: {self.sources}")
@@ -297,16 +281,21 @@ class CameraManager:
             return True
         return False
 
+    # ✨ [แก้ไข] ย้ายฟังก์ชันนี้เข้ามาใน Class CameraManager
+    def get_latest_frame(self):
+        # ดึงภาพสุดท้ายจากกล้องตัวแรกที่เปิดอยู่
+        for cam in self.sources.values():
+            if cam.is_open and cam.last_frame:
+                npimg = np.frombuffer(cam.last_frame, np.uint8)
+                return cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+        return None
 
-# ✨✨✨ [ แก้ไขฟังก์ชันนี้ ] ✨✨✨
+# (ฟังก์ชัน discover_local_devices อยู่นอก Class ถูกต้องแล้ว)
 def discover_local_devices(
         max_index: int = 10,
         test_frame: bool = True,
         exclude_srcs: List[str] = None
 ) -> List[dict]:
-    """
-    สำรวจกล้อง (ฉบับแก้ไข: จะไม่พยายามเปิดกล้องที่ 'exclude_srcs' ซ้ำ)
-    """
     if exclude_srcs is None:
         exclude_srcs = []
 
@@ -330,7 +319,6 @@ def discover_local_devices(
         if src in seen: continue
         seen.add(src)
 
-        # ✨ [ใหม่] ถ้า src นี้กำลังถูกใช้งานอยู่ (เช่น โดย MJPEG)
         if src in exclude_srcs:
             print(f"Skipping discovery for src {src} (already in use).")
             devices.append({
@@ -353,7 +341,6 @@ def discover_local_devices(
                 ok_frame = False
         if cap: cap.release()
 
-        # (เพิ่มการตรวจสอบ readable)
         if opened and ok_frame:
             devices.append({
                 "src": src, "opened": opened, "readable": ok_frame,

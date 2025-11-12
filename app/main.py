@@ -1,15 +1,13 @@
-# app/main.py
+import cv2
 from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect, Depends, HTTPException, Response, \
     Body
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql import func, asc
-import os, io, csv, asyncio, base64, time, uuid, shutil  # 👈 เพิ่ม shutil
-from datetime import datetime, date, timedelta  # 👈 เพิ่ม timedelta
-
-from fastapi.responses import JSONResponse
+import os, io, csv, asyncio, base64, time, uuid, shutil
+from datetime import datetime, date, timedelta
 
 from .db_models import get_db, UserFace, User, AttendanceLog, Subject, UserType
 from .camera_handler import CameraManager, discover_local_devices
@@ -27,28 +25,32 @@ app.add_middleware(
 )
 
 # --- 2. Mount Static Directories ---
-MEDIA_ROOT = os.getenv("MEDIA_ROOT", "./data/faces/train")
-# (ลบ COVERS_MEDIA_ROOT และ app.mount ของ /static/covers เพราะ Schema ใหม่ไม่มี cover_image)
+MEDIA_ROOT = os.getenv("MEDIA_ROOT", "./data/faces/train")  # สำหรับรูป Train
+# ✨ [แก้ไข] แก้ Path ให้ตรงกับรูปโฟลเดอร์ของคุณ
+SNAPSHOTS_DIR = "media/snapshot"  # สำหรับรูป Log
+
 os.makedirs(MEDIA_ROOT, exist_ok=True)
+os.makedirs(SNAPSHOTS_DIR, exist_ok=True)  # สร้างโฟลเดอร์ media/snapshot
+
 app.mount("/static", StaticFiles(directory="data"), name="static")
+# ✨ [แก้ไข] Mount โฟลเดอร์ snapshots ให้ตรงกับ Path ใหม่
+app.mount("/media/snapshot", StaticFiles(directory=SNAPSHOTS_DIR), name="static_snapshots")
 
 # --- 3. Camera Manager Setup ---
 print("Discovering local devices for initial setup...")
+# ... (ส่วนนี้เหมือนเดิม) ...
 discovered_devices = discover_local_devices(test_frame=False)
 available_sources = [d['src'] for d in discovered_devices if d.get('opened', False)]
 print(f"Available camera sources found: {available_sources}")
-
 CAMERA_SOURCES = {}
 if len(available_sources) > 0:
     CAMERA_SOURCES['entrance'] = available_sources[0]
 else:
     CAMERA_SOURCES['entrance'] = "0"
-
 if len(available_sources) > 1:
     CAMERA_SOURCES['exit'] = available_sources[1]
 else:
     CAMERA_SOURCES['exit'] = CAMERA_SOURCES['entrance']
-
 print(f"Assigning camera sources: {CAMERA_SOURCES}")
 cam_mgr = CameraManager(CAMERA_SOURCES, fps=30, width=640, height=480)
 
@@ -67,7 +69,7 @@ async def upload_faces(user_id: int = Form(...), images: list[UploadFile] = File
     os.makedirs(user_dir, exist_ok=True)
     for f in images:
         file_ext = os.path.splitext(f.filename)[1]
-        name = f"{uuid.uuid4()}{file_ext}"  # ใช้ UUID ป้องกันชื่อซ้ำ
+        name = f"{uuid.uuid4()}{file_ext}"
         dest = os.path.join(user_dir, name)
         content = await f.read()
         with open(dest, "wb") as wf: wf.write(content)
@@ -91,6 +93,7 @@ def train_refresh(db: Session = Depends(get_db)):
 
 
 # --- 5. Camera Control & Stream Endpoints ---
+# ... (ส่วนนี้เหมือนเดิมทั้งหมด /cameras, /mjpeg, /ws, /discover, /config) ...
 @app.get("/cameras")
 def list_cameras(): return {"cams": cam_mgr.list()}
 
@@ -236,17 +239,19 @@ def stop_attendance():
     return {"message": "Attendance stopped"}
 
 
-COOLDOWN_MINUTES = 2  # กันบันทึกซ้ำเร็วเกินไป
+COOLDOWN_MINUTES = 2
 
 
-@app.get("/attendance/poll", response_model=List[dict])
+@app.get("/attendance/poll", response_model=list[dict])
 async def get_attendance_events(db: Session = Depends(get_db)):
     events = cam_mgr.get_attendance_events()
-    if not events: return []
+    if not events:
+        return []
 
     new_logs_for_frontend = []
     user_ids_to_check = {e["user_id"] for e in events if e.get("user_id")}
-    if not user_ids_to_check: return []
+    if not user_ids_to_check:
+        return []
 
     users_data = db.query(
         User.user_id, User.subject_id, User.student_code, User.name
@@ -255,7 +260,8 @@ async def get_attendance_events(db: Session = Depends(get_db)):
 
     for event in events:
         user_id = event.get("user_id")
-        if not user_id or user_id not in user_info_map: continue
+        if not user_id or user_id not in user_info_map:
+            continue
 
         user_info = user_info_map[user_id]
         event_timestamp = datetime.fromtimestamp(event["timestamp"])
@@ -267,19 +273,39 @@ async def get_attendance_events(db: Session = Depends(get_db)):
 
         if not last_log or (event_timestamp - last_log.timestamp) > timedelta(minutes=COOLDOWN_MINUTES):
             new_log_db = AttendanceLog(
-                user_id=user_id, subject_id=user_info.subject_id, action=event["action"],
-                timestamp=event_timestamp, confidence=event.get("confidence")
+                user_id=user_id,
+                subject_id=user_info.subject_id,
+                action=event["action"],
+                timestamp=event_timestamp,
+                confidence=event.get("confidence"),
             )
-            db.add(new_log_db);
+
+            # (บันทึก Snapshot โดยใช้ SNAPSHOTS_DIR = "media/snapshot")
+            if event["action"].lower() == "enter" and event.get("frame") is not None:
+                os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
+                snap_name = f"{user_id}_{int(time.time())}.jpg"
+                snap_path = os.path.join(SNAPSHOTS_DIR, snap_name)
+                cv2.imwrite(snap_path, event["frame"])
+                new_log_db.snapshot_path = snap_path
+
+            db.add(new_log_db)
             db.flush()
+
             new_logs_for_frontend.append({
-                "log_id": new_log_db.log_id, "user_id": user_id,
-                "user_name": user_info.name, "student_code": user_info.student_code or "N/A",
-                "action": event["action"], "timestamp": event_timestamp.isoformat(),
-                "confidence": event.get("confidence")
+                "log_id": new_log_db.log_id,
+                "user_id": user_id,
+                "user_name": user_info.name,
+                "student_code": user_info.student_code or "N/A",
+                "action": event["action"],
+                "timestamp": event_timestamp.isoformat(),
+                "confidence": event.get("confidence"),
+                # ✨ [แก้ไข] เปลี่ยนชื่อ Key เป็น "snapshot_path"
+                "snapshot_path": getattr(new_log_db, "snapshot_path", None),
             })
 
-    if new_logs_for_frontend: db.commit()
+    if new_logs_for_frontend:
+        db.commit()
+
     return new_logs_for_frontend
 
 
@@ -297,7 +323,7 @@ async def get_attendance_logs(
         .outerjoin(Subject, AttendanceLog.subject_id == Subject.subject_id)
         .order_by(AttendanceLog.timestamp.desc())
     )
-    query = query.filter(User.is_deleted == 0)  # กรอง User ที่ยังไม่ถูกลบ
+    query = query.filter(User.is_deleted == 0)
     if start_date: query = query.filter(func.date(AttendanceLog.timestamp) >= start_date)
     if end_date: query = query.filter(func.date(AttendanceLog.timestamp) <= end_date)
     if subject_id is not None: query = query.filter(AttendanceLog.subject_id == subject_id)
@@ -310,7 +336,9 @@ async def get_attendance_logs(
             "subject_id": log.subject_id, "action": log.action,
             "timestamp": log.timestamp.isoformat(), "confidence": log.confidence,
             "user_name": user_name or "N/A", "student_code": student_code or "N/A",
-            "subject_name": subject_name or None
+            "subject_name": subject_name or None,
+            # ✨ [แก้ไข] ใช้ Key "snapshot_path" (อันนี้ถูกต้องอยู่แล้ว)
+            "snapshot_path": log.snapshot_path if hasattr(log, 'snapshot_path') else None
         })
     return results
 
@@ -324,8 +352,6 @@ async def clear_attendance_log(cam_id: str):
 
 
 # --- 7. User Management & Subject Endpoints ---
-
-# ✨ Pydantic Models สำหรับ Subject (Schema ใหม่)
 class SubjectCreate(BaseModel):
     subject_name: str
     section: Optional[str] = None
@@ -335,11 +361,10 @@ class SubjectCreate(BaseModel):
 class SubjectResponse(SubjectCreate):
     subject_id: int
 
-    class Config:  # 👈 เพิ่ม Config.from_attributes (ORM mode)
+    class Config:
         from_attributes = True
 
 
-# Pydantic Models สำหรับ User
 class UserCreate(BaseModel):
     student_code: Optional[str] = None
     name: str;
@@ -355,14 +380,12 @@ class UserUpdate(BaseModel):
     role: Optional[str] = None
 
 
-# ✨ [แก้ไข] GET /subjects
 @app.get("/subjects", response_model=List[SubjectResponse])
 def list_subjects(db: Session = Depends(get_db)):
     subjects = db.query(Subject).all()
-    return subjects  # 👈 return object Subject ตรงๆ ได้เลยถ้าใช้ ORM mode
+    return subjects
 
 
-# ✨ [แก้ไข] POST /subjects
 @app.post("/subjects", response_model=SubjectResponse)
 def create_subject(subject: SubjectCreate, db: Session = Depends(get_db)):
     existing = db.query(Subject).filter(
@@ -371,7 +394,6 @@ def create_subject(subject: SubjectCreate, db: Session = Depends(get_db)):
     ).first()
     if existing:
         raise HTTPException(status_code=400, detail="Subject with this name and section already exists")
-
     new_subject = Subject(
         subject_name=subject.subject_name,
         section=subject.section,
@@ -454,7 +476,6 @@ def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db)
     return {"message": "User updated", "user_id": user.user_id}
 
 
-# ✨ [แก้ไข] DELETE /users/{user_id} (เวอร์ชันล่าสุดที่ลบไฟล์และเปลี่ยน student_code)
 @app.delete("/users/{user_id}")
 def delete_user(user_id: int, db: Session = Depends(get_db)):
     user = db.query(User).options(selectinload(User.faces)).filter(User.user_id == user_id,
@@ -462,26 +483,15 @@ def delete_user(user_id: int, db: Session = Depends(get_db)):
     if not user: raise HTTPException(status_code=404, detail="User not found")
     user_face_dir = os.path.join(MEDIA_ROOT, str(user_id))
     try:
-        # 1. ลบข้อมูล faces ใน DB
         if user.faces:
             for face in user.faces: db.delete(face)
-
-        # 2. อัปเดต User (Soft delete + แก้ student_code)
         user.is_deleted = 1
-        if user.student_code:
-            user.student_code = f"{user.student_code}_deleted_{int(time.time())}"
-
-        # 3. Commit การเปลี่ยนแปลงใน DB
+        if user.student_code: user.student_code = f"{user.student_code}_deleted_{int(time.time())}"
         db.commit()
-
-        # 4. ลบโฟลเดอร์รูปภาพออกจาก Disk
-        if os.path.isdir(user_face_dir):
-            shutil.rmtree(user_face_dir)
-
+        if os.path.isdir(user_face_dir): shutil.rmtree(user_face_dir)
     except Exception as e:
         db.rollback();
         raise HTTPException(status_code=500, detail=f"Failed to delete user data: {e}")
-
     return {"message": f"User {user_id} ({user.name}) marked as deleted and all face data removed."}
 
 
@@ -519,19 +529,13 @@ def export_attendance_logs(
             func.date(AttendanceLog.timestamp).label("log_date"),
             AttendanceLog.action,
             AttendanceLog.timestamp,
+            AttendanceLog.snapshot_path
         )
-        # ✨ [แก้ไขที่ 1] เปลี่ยนจาก .join เป็น .outerjoin
         .outerjoin(User, AttendanceLog.user_id == User.user_id)
-        # ✨ (อันนี้ควรแก้แล้วจากรอบก่อน)
         .outerjoin(Subject, AttendanceLog.subject_id == Subject.subject_id)
-        # ✨ [แก้ไขที่ 2] ย้าย Filter นี้มาไว้หลัง Join
-        # .filter(User.is_deleted == 0)
+        .filter(User.is_deleted != 1)
         .order_by(AttendanceLog.user_id, AttendanceLog.timestamp.asc())
     )
-
-    # ✨ [แก้ไขที่ 3] กรอง is_deleted ตรงนี้แทน
-    # (ต้องเช็ค User.is_deleted != 1 เพราะถ้าเป็น NULL (จาก outerjoin) ก็ยังเอา)
-    query = query.filter(User.is_deleted != 1)
 
     if subject_id:
         query = query.filter(AttendanceLog.subject_id == subject_id)
@@ -542,23 +546,21 @@ def export_attendance_logs(
 
     logs = query.all()
 
-    # จัดกลุ่มตาม user + วัน
     grouped = {}
     for log in logs:
-        # ✨ [แก้ไขที่ 4] เผื่อ user_id เป็น None จาก Outer Join
         key = (log.user_id if log.user_id else 'UNKNOWN', log.log_date)
         grouped.setdefault(key, []).append(log)
 
     results = []
     for (uid, log_date), entries in grouped.items():
-
         ins = [e for e in entries if e.action.lower() == "enter"]
         outs = [e for e in entries if e.action.lower() == "exit"]
 
         if not ins:
-            continue  # ไม่มีการเข้า
+            continue
 
-        in_time = ins[0].timestamp
+        in_log = ins[0]
+        in_time = in_log.timestamp
         out_time = outs[-1].timestamp if outs else None
 
         duration = timedelta(0)
@@ -567,6 +569,8 @@ def export_attendance_logs(
 
         user_name = entries[0].user_name if entries[0].user_name else "Unknown User"
         student_code = entries[0].student_code if entries[0].student_code else "N/A"
+
+        snapshot_path = getattr(in_log, "snapshot_path", None)
 
         results.append({
             "user_id": uid,
@@ -578,7 +582,9 @@ def export_attendance_logs(
             "in_time": in_time.isoformat(),
             "out_time": out_time.isoformat() if out_time else None,
             "duration_minutes": round(duration.total_seconds() / 60, 2),
-            "status": "Present" if out_time else "No Exit"
+            "status": "Present" if out_time else "No Exit",
+            # ✨ [แก้ไข] เปลี่ยนชื่อ Key เป็น "snapshot_path"
+            "snapshot_path": snapshot_path
         })
 
     return JSONResponse(content=results)
