@@ -26,19 +26,17 @@ app.add_middleware(
 
 # --- 2. Mount Static Directories ---
 MEDIA_ROOT = os.getenv("MEDIA_ROOT", "./data/faces/train")  # สำหรับรูป Train
-# ✨ [แก้ไข] แก้ Path ให้ตรงกับรูปโฟลเดอร์ของคุณ
-SNAPSHOTS_DIR = "media/snapshot"  # สำหรับรูป Log
+SNAPSHOTS_DIR = "media/snapshot"  # ✨ [แก้ไข] Path ให้ตรงกับโฟลเดอร์
 
 os.makedirs(MEDIA_ROOT, exist_ok=True)
-os.makedirs(SNAPSHOTS_DIR, exist_ok=True)  # สร้างโฟลเดอร์ media/snapshot
+os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
 
 app.mount("/static", StaticFiles(directory="data"), name="static")
-# ✨ [แก้ไข] Mount โฟลเดอร์ snapshots ให้ตรงกับ Path ใหม่
+# ✨ [แก้ไข] Mount Path ให้ตรงกับ SNAPSHOTS_DIR
 app.mount("/media/snapshot", StaticFiles(directory=SNAPSHOTS_DIR), name="static_snapshots")
 
 # --- 3. Camera Manager Setup ---
 print("Discovering local devices for initial setup...")
-# ... (ส่วนนี้เหมือนเดิม) ...
 discovered_devices = discover_local_devices(test_frame=False)
 available_sources = [d['src'] for d in discovered_devices if d.get('opened', False)]
 print(f"Available camera sources found: {available_sources}")
@@ -93,7 +91,6 @@ def train_refresh(db: Session = Depends(get_db)):
 
 
 # --- 5. Camera Control & Stream Endpoints ---
-# ... (ส่วนนี้เหมือนเดิมทั้งหมด /cameras, /mjpeg, /ws, /discover, /config) ...
 @app.get("/cameras")
 def list_cameras(): return {"cams": cam_mgr.list()}
 
@@ -239,7 +236,8 @@ def stop_attendance():
     return {"message": "Attendance stopped"}
 
 
-COOLDOWN_MINUTES = 2
+# ✨ [แก้ไข] เปลี่ยน Cooldown เป็น 30 วินาที
+COOLDOWN_SECONDS = 30
 
 
 @app.get("/attendance/poll", response_model=list[dict])
@@ -266,12 +264,47 @@ async def get_attendance_events(db: Session = Depends(get_db)):
         user_info = user_info_map[user_id]
         event_timestamp = datetime.fromtimestamp(event["timestamp"])
 
+        # ✨ --- [แก้ไข Logic การตรวจสอบ Log ซ้ำ] --- ✨
+
+        # 1. ค้นหา Log ล่าสุดของ User นี้ (ไม่จำกัด action)
         last_log = db.query(AttendanceLog).filter(
-            AttendanceLog.user_id == user_id,
-            AttendanceLog.action == event["action"]
+            AttendanceLog.user_id == user_id
         ).order_by(AttendanceLog.timestamp.desc()).first()
 
-        if not last_log or (event_timestamp - last_log.timestamp) > timedelta(minutes=COOLDOWN_MINUTES):
+        # 2. ตรวจสอบเงื่อนไขการบันทึก
+        can_log = False
+        time_since_last_log = timedelta(days=1)  # (ตั้งค่าเริ่มต้นให้ผ่าน Cooldown เสมอ)
+        if last_log:
+            time_since_last_log = event_timestamp - last_log.timestamp
+
+        if not last_log:
+            # (A) ไม่เคยมี Log มาก่อน: (ต้องเป็น 'enter' เท่านั้น)
+            if event["action"].lower() == "enter":
+                can_log = True
+
+        elif event["action"].lower() == "enter":
+            # (B) ถ้า Event เป็น 'enter':
+            if last_log.action.lower() == "exit":
+                # ❗️ ถ้า Log ล่าสุดคือ "exit", ให้รอ 30 วินาที
+                if time_since_last_log >= timedelta(seconds=COOLDOWN_SECONDS):
+                    can_log = True
+            elif last_log.action.lower() == "enter":
+                # (กัน spam 'enter')
+                if time_since_last_log >= timedelta(seconds=COOLDOWN_SECONDS):
+                    can_log = True
+
+        elif event["action"].lower() == "exit":
+            # (C) ถ้า Event เป็น 'exit':
+            if last_log.action.lower() == "enter":
+                # (อนุญาตให้ออกทันที ไม่ต้องรอ Cooldown)
+                can_log = True
+            elif last_log.action.lower() == "exit":
+                # (กัน spam 'exit')
+                if time_since_last_log >= timedelta(seconds=COOLDOWN_SECONDS):
+                    can_log = True
+
+        # 3. ถ้าผ่านเงื่อนไข (can_log == True) ค่อยบันทึก
+        if can_log:
             new_log_db = AttendanceLog(
                 user_id=user_id,
                 subject_id=user_info.subject_id,
@@ -280,7 +313,6 @@ async def get_attendance_events(db: Session = Depends(get_db)):
                 confidence=event.get("confidence"),
             )
 
-            # (บันทึก Snapshot โดยใช้ SNAPSHOTS_DIR = "media/snapshot")
             if event["action"].lower() == "enter" and event.get("frame") is not None:
                 os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
                 snap_name = f"{user_id}_{int(time.time())}.jpg"
@@ -299,9 +331,10 @@ async def get_attendance_events(db: Session = Depends(get_db)):
                 "action": event["action"],
                 "timestamp": event_timestamp.isoformat(),
                 "confidence": event.get("confidence"),
-                # ✨ [แก้ไข] เปลี่ยนชื่อ Key เป็น "snapshot_path"
                 "snapshot_path": getattr(new_log_db, "snapshot_path", None),
             })
+
+        # ✨ --- [จบการแก้ไข Logic] --- ✨
 
     if new_logs_for_frontend:
         db.commit()
@@ -323,7 +356,9 @@ async def get_attendance_logs(
         .outerjoin(Subject, AttendanceLog.subject_id == Subject.subject_id)
         .order_by(AttendanceLog.timestamp.desc())
     )
-    query = query.filter(User.is_deleted == 0)
+    # (เราอาจจะกรอง User ที่ถูกลบออก)
+    query = query.filter(User.is_deleted != 1)  # (ใช้ != 1 เพื่อรวม NULL ที่เกิดจาก OuterJoin)
+
     if start_date: query = query.filter(func.date(AttendanceLog.timestamp) >= start_date)
     if end_date: query = query.filter(func.date(AttendanceLog.timestamp) <= end_date)
     if subject_id is not None: query = query.filter(AttendanceLog.subject_id == subject_id)
@@ -337,7 +372,6 @@ async def get_attendance_logs(
             "timestamp": log.timestamp.isoformat(), "confidence": log.confidence,
             "user_name": user_name or "N/A", "student_code": student_code or "N/A",
             "subject_name": subject_name or None,
-            # ✨ [แก้ไข] ใช้ Key "snapshot_path" (อันนี้ถูกต้องอยู่แล้ว)
             "snapshot_path": log.snapshot_path if hasattr(log, 'snapshot_path') else None
         })
     return results
@@ -583,7 +617,6 @@ def export_attendance_logs(
             "out_time": out_time.isoformat() if out_time else None,
             "duration_minutes": round(duration.total_seconds() / 60, 2),
             "status": "Present" if out_time else "No Exit",
-            # ✨ [แก้ไข] เปลี่ยนชื่อ Key เป็น "snapshot_path"
             "snapshot_path": snapshot_path
         })
 

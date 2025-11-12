@@ -32,6 +32,7 @@ class CameraSource:
     _ai_thread: Optional[threading.Thread] = field(default=None, repr=False)
     last_ai_result: List[Dict[str, Any]] = field(default_factory=list)
     is_ai_paused: bool = True
+
     cap_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
@@ -106,9 +107,13 @@ class CameraManager:
 
             if cam._thread and cam._thread.is_alive():
                 cam._thread.join(timeout=1.0)
+                if cam._thread.is_alive():
+                    print(f"[WARN] Stream worker {cam.cam_id} failed to join.")
 
             if cam._ai_thread and cam._ai_thread.is_alive():
                 cam._ai_thread.join(timeout=1.0)
+                if cam._ai_thread.is_alive():
+                    print(f"[WARN] AI worker {cam.cam_id} failed to join.")
 
             if cam.cap:
                 try:
@@ -175,7 +180,6 @@ class CameraManager:
 
         while not cam._stop:
             try:
-                # (frame คือรูปภาพที่ดึงมาจาก Queue)
                 frame = cam.ai_queue.get(timeout=1.0)
                 if frame is None:
                     break
@@ -210,12 +214,17 @@ class CameraManager:
                                     "user_id": user_id, "name": name,
                                     "action": current_action, "timestamp": current_time,
                                     "confidence": res.get("similarity"),
-                                    # ✨ [แก้ไข] เพิ่ม frame เข้าไปใน event ด้วย!
-                                    "frame": frame
+                                    "frame": frame  # (โค้ดนี้ถูกต้องแล้ว)
                                 }
                                 self.check_in_queue.put(check_in_data)
                                 print(f"✅ [ATTENDANCE] Checked in: {name} (Action: {current_action})")
                                 trackers.pop(name, None)
+
+                                # ✨ [แก้ไข] เพิ่ม Logic นี้
+                                # ถ้า action คือ "exit" (ออก)
+                                # ให้ลบชื่อออกจาก session ทั้งหมด เพื่อให้ "enter" (เข้า) ใหม่ได้
+                                if current_action == "exit":
+                                    self.reset_user_session(name)
 
                 lost_names = set(trackers.keys()) - seen_in_frame
                 for name in lost_names:
@@ -265,6 +274,21 @@ class CameraManager:
 
         print(f"Reconfigure complete. Current sources: {self.sources}")
 
+    # ✨ [แก้ไข] เพิ่มฟังก์ชันนี้เข้ามา
+    def reset_user_session(self, user_name: str):
+        """
+        ลบ user ออกจาก 'checked_in_session' ของกล้อง *ทั้งหมด*
+        เพื่อให้ user นี้สามารถ check-in (enter) ใหม่ได้
+        """
+        print(f"[Session] Resetting session for user: {user_name}")
+        for cam_id, session_set in self.checked_in_session.items():
+            if user_name in session_set:
+                try:
+                    session_set.remove(user_name)
+                    print(f"[Session] Removed {user_name} from {cam_id} session.")
+                except KeyError:
+                    pass  # (อาจจะเกิด Race Condition แต่ไม่เป็นไร)
+
     def get_attendance_events(self) -> List[dict]:
         events = []
         while not self.check_in_queue.empty():
@@ -281,14 +305,13 @@ class CameraManager:
             return True
         return False
 
-    # ✨ [แก้ไข] ย้ายฟังก์ชันนี้เข้ามาใน Class CameraManager
     def get_latest_frame(self):
-        # ดึงภาพสุดท้ายจากกล้องตัวแรกที่เปิดอยู่
         for cam in self.sources.values():
             if cam.is_open and cam.last_frame:
                 npimg = np.frombuffer(cam.last_frame, np.uint8)
                 return cv2.imdecode(npimg, cv2.IMREAD_COLOR)
         return None
+
 
 # (ฟังก์ชัน discover_local_devices อยู่นอก Class ถูกต้องแล้ว)
 def discover_local_devices(
