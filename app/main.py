@@ -1,15 +1,13 @@
-# app/main.py
+import cv2
 from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect, Depends, HTTPException, Response, \
     Body
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql import func
-from sqlalchemy import or_
 import os, io, csv, asyncio, base64, time, uuid
 from datetime import datetime, date
-import pandas as pd
 
 from .db_models import get_db, UserFace, User, AttendanceLog, Subject, UserType
 from .camera_handler import CameraManager, discover_local_devices
@@ -27,30 +25,30 @@ app.add_middleware(
 )
 
 # --- 2. Mount Static Directories ---
-MEDIA_ROOT = os.getenv("MEDIA_ROOT", "./data/faces/train")
-COVERS_MEDIA_ROOT = "./data/subject_covers"
+MEDIA_ROOT = os.getenv("MEDIA_ROOT", "./data/faces/train")  # สำหรับรูป Train
+SNAPSHOTS_DIR = "media/snapshot"  # ✨ [แก้ไข] Path ให้ตรงกับโฟลเดอร์
+
 os.makedirs(MEDIA_ROOT, exist_ok=True)
-os.makedirs(COVERS_MEDIA_ROOT, exist_ok=True)
+os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
+
 app.mount("/static", StaticFiles(directory="data"), name="static")
-app.mount("/static/covers", StaticFiles(directory=COVERS_MEDIA_ROOT), name="static_covers")
+# ✨ [แก้ไข] Mount Path ให้ตรงกับ SNAPSHOTS_DIR
+app.mount("/media/snapshot", StaticFiles(directory=SNAPSHOTS_DIR), name="static_snapshots")
 
 # --- 3. Camera Manager Setup ---
 print("Discovering local devices for initial setup...")
 discovered_devices = discover_local_devices(test_frame=False)
 available_sources = [d['src'] for d in discovered_devices if d.get('opened', False)]
 print(f"Available camera sources found: {available_sources}")
-
 CAMERA_SOURCES = {}
 if len(available_sources) > 0:
     CAMERA_SOURCES['entrance'] = available_sources[0]
 else:
     CAMERA_SOURCES['entrance'] = "0"
-
 if len(available_sources) > 1:
     CAMERA_SOURCES['exit'] = available_sources[1]
 else:
     CAMERA_SOURCES['exit'] = CAMERA_SOURCES['entrance']
-
 print(f"Assigning camera sources: {CAMERA_SOURCES}")
 cam_mgr = CameraManager(CAMERA_SOURCES, fps=30, width=640, height=480)
 
@@ -85,7 +83,7 @@ async def upload_faces(user_id: int = Form(...), images: list[UploadFile] = File
 def train_refresh(db: Session = Depends(get_db)):
     rows = (
         db.query(UserFace.user_id, UserFace.file_path, User.name)
-        .join(User, User.user_id == UserFace.user_id).all()
+        .join(User, User.user_id == User.user_id).all()
     )
     users, total = refresh_facebank_from_db(rows)
     cnt = load_facebank()
@@ -120,17 +118,25 @@ def camera_mjpeg(cam_id: str):
     boundary = "frame"
 
     async def gen():
+        if cam_id not in cam_mgr.sources:
+            print(f"MJPEG: Camera ID {cam_id} not found in sources.")
+            return
         try:
             cam_mgr.open(cam_id)
             print(f"Opening MJPEG stream for {cam_id} (Source: {cam_mgr.sources[cam_id].src})")
             while True:
                 try:
                     jpg = cam_mgr.get_jpeg(cam_id)
+                    if not jpg:
+                        await asyncio.sleep(0.1)
+                        continue
                     yield (
                             b"--" + boundary.encode() + b"\r\n" + b"Content-Type: image/jpeg\r\n" + b"Cache-Control: no-cache\r\n" + b"Pragma: no-cache\r\n" + b"Content-Length: " + str(
                         len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
                 except Exception as e:
-                    print(f"MJPEG gen error for {cam_id}: {e}")
+                    if not cam_mgr.sources[cam_id].is_open:
+                        print(f"MJPEG {cam_id} stopping because camera is no longer open.")
+                        break
                     await asyncio.sleep(0.1)
                 await asyncio.sleep(cam_mgr.interval)
         except Exception as e:
@@ -171,12 +177,17 @@ async def ws_ai_results(ws: WebSocket, cam_id: str):
     cam = cam_mgr.sources[cam_id]
     if not cam.is_open:
         try:
+            print(f"WS AI opening camera {cam_id}...")
             cam_mgr.open(cam_id)
         except Exception as e:
-            await ws.close(code=1011, reason=f"Could not open camera: {e}"); return
+            await ws.close(code=1011, reason=f"Could not open camera: {e}");
+            return
     print(f"[WS AI {cam_id}] Client connected.")
     try:
         while True:
+            if not cam.is_open:
+                print(f"[WS AI {cam_id}] Camera is closed, disconnecting.")
+                break
             results = cam.last_ai_result
             await ws.send_json({"cam_id": cam_id, "results": results, "ai_width": cam_mgr.ai_process_width,
                                 "ai_height": cam_mgr.ai_process_height})
@@ -185,6 +196,8 @@ async def ws_ai_results(ws: WebSocket, cam_id: str):
         print(f"[WS AI {cam_id}] Client disconnected.")
     except Exception as e:
         print(f"[WS AI {cam_id}] Error: {e}")
+    finally:
+        print(f"[WS AI {cam_id}] Connection closed.")
 
 
 @app.get("/cameras/discover")
@@ -251,7 +264,6 @@ def stop_attendance():
     return {"message": "Attendance stopped"}
 
 
-
 @app.get("/attendance/poll", response_model=List[dict])
 async def get_attendance_events(db: Session = Depends(get_db)):
     events = cam_mgr.get_attendance_events()
@@ -269,7 +281,9 @@ async def get_attendance_events(db: Session = Depends(get_db)):
 
     for event in events:
         user_id = event.get("user_id")
-        if not user_id or user_id not in user_info_map: continue
+        if not user_id or user_id not in user_info_map:
+            continue
+
         user_info = user_info_map[user_id]
 
         log_subject_id: Optional[int] = None
@@ -287,6 +301,49 @@ async def get_attendance_events(db: Session = Depends(get_db)):
                                                       func.date(AttendanceLog.timestamp) == today).first()
         if not existing_log:
             event_timestamp = datetime.fromtimestamp(event["timestamp"])
+        event_timestamp = datetime.fromtimestamp(event["timestamp"])
+
+        # ✨ --- [แก้ไข Logic การตรวจสอบ Log ซ้ำ] --- ✨
+
+        # 1. ค้นหา Log ล่าสุดของ User นี้ (ไม่จำกัด action)
+        last_log = db.query(AttendanceLog).filter(
+            AttendanceLog.user_id == user_id
+        ).order_by(AttendanceLog.timestamp.desc()).first()
+
+        # 2. ตรวจสอบเงื่อนไขการบันทึก
+        can_log = False
+        time_since_last_log = timedelta(days=1)  # (ตั้งค่าเริ่มต้นให้ผ่าน Cooldown เสมอ)
+        if last_log:
+            time_since_last_log = event_timestamp - last_log.timestamp
+
+        if not last_log:
+            # (A) ไม่เคยมี Log มาก่อน: (ต้องเป็น 'enter' เท่านั้น)
+            if event["action"].lower() == "enter":
+                can_log = True
+
+        elif event["action"].lower() == "enter":
+            # (B) ถ้า Event เป็น 'enter':
+            if last_log.action.lower() == "exit":
+                # ❗️ ถ้า Log ล่าสุดคือ "exit", ให้รอ 30 วินาที
+                if time_since_last_log >= timedelta(seconds=COOLDOWN_SECONDS):
+                    can_log = True
+            elif last_log.action.lower() == "enter":
+                # (กัน spam 'enter')
+                if time_since_last_log >= timedelta(seconds=COOLDOWN_SECONDS):
+                    can_log = True
+
+        elif event["action"].lower() == "exit":
+            # (C) ถ้า Event เป็น 'exit':
+            if last_log.action.lower() == "enter":
+                # (อนุญาตให้ออกทันที ไม่ต้องรอ Cooldown)
+                can_log = True
+            elif last_log.action.lower() == "exit":
+                # (กัน spam 'exit')
+                if time_since_last_log >= timedelta(seconds=COOLDOWN_SECONDS):
+                    can_log = True
+
+        # 3. ถ้าผ่านเงื่อนไข (can_log == True) ค่อยบันทึก
+        if can_log:
             new_log_db = AttendanceLog(
                 user_id=user_id,
                 subject_id=log_subject_id,  # (ใช้ subject_id ที่เราเลือก)
@@ -294,17 +351,33 @@ async def get_attendance_events(db: Session = Depends(get_db)):
                 timestamp=event_timestamp,
                 confidence=event.get("confidence")
             )
-            db.add(new_log_db);
+
+            if event["action"].lower() == "enter" and event.get("frame") is not None:
+                os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
+                snap_name = f"{user_id}_{int(time.time())}.jpg"
+                snap_path = os.path.join(SNAPSHOTS_DIR, snap_name)
+                cv2.imwrite(snap_path, event["frame"])
+                new_log_db.snapshot_path = snap_path
+
+            db.add(new_log_db)
             db.flush()
-            new_log_data = {
-                "log_id": new_log_db.log_id, "user_id": user_id,
-                "user_name": user_info.name, "student_code": user_info.student_code or "N/A",
-                "action": event["action"], "timestamp": event_timestamp.isoformat(),
+
+            new_logs_for_frontend.append({
+                "log_id": new_log_db.log_id,
+                "user_id": user_id,
+                "user_name": user_info.name,
+                "student_code": user_info.student_code or "N/A",
+                "action": event["action"],
+                "timestamp": event_timestamp.isoformat(),
                 "confidence": event.get("confidence"),
-                "subject_id": log_subject_id  # (เพิ่มการส่ง subject_id กลับไป)
-            }
-            new_logs_for_frontend.append(new_log_data)
-    if new_logs_for_frontend: db.commit()
+                "snapshot_path": getattr(new_log_db, "snapshot_path", None),
+            })
+
+        # ✨ --- [จบการแก้ไข Logic] --- ✨
+
+    if new_logs_for_frontend:
+        db.commit()
+
     return new_logs_for_frontend
 
 
@@ -322,12 +395,13 @@ async def get_attendance_logs(
         .outerjoin(Subject, AttendanceLog.subject_id == Subject.subject_id)
         .order_by(AttendanceLog.timestamp.desc())
     )
-    query = query.filter(User.is_deleted == 0)
-    query = query.filter(or_(Subject.is_deleted == None, Subject.is_deleted == 0))
+    # (เราอาจจะกรอง User ที่ถูกลบออก)
+    query = query.filter(User.is_deleted != 1)  # (ใช้ != 1 เพื่อรวม NULL ที่เกิดจาก OuterJoin)
 
     if start_date: query = query.filter(func.date(AttendanceLog.timestamp) >= start_date)
     if end_date: query = query.filter(func.date(AttendanceLog.timestamp) <= end_date)
     if subject_id is not None: query = query.filter(AttendanceLog.subject_id == subject_id)
+
     logs = query.all()
     results = []
     for log, user_name, student_code, subject_name in logs:
@@ -336,7 +410,8 @@ async def get_attendance_logs(
             "subject_id": log.subject_id, "action": log.action,
             "timestamp": log.timestamp.isoformat(), "confidence": log.confidence,
             "user_name": user_name or "N/A", "student_code": student_code or "N/A",
-            "subject_name": subject_name or None
+            "subject_name": subject_name or None,
+            "snapshot_path": log.snapshot_path if hasattr(log, 'snapshot_path') else None
         })
     return results
 
@@ -423,71 +498,11 @@ def list_subjects(db: Session = Depends(get_db)):
     ]
 
 
-class SubjectCreate(BaseModel):
-    subject_name: str
-    section: Optional[str] = None
-    schedule: Optional[str] = None
+class SubjectResponse(SubjectCreate):
+    subject_id: int
 
-
-@app.post("/subjects")
-async def create_subject(
-        payload: SubjectCreate,
-        db: Session = Depends(get_db)
-):
-    existing_subject = db.query(Subject).filter(
-        Subject.subject_name == payload.subject_name,
-        Subject.section == payload.section
-    ).first()
-
-    if existing_subject:
-        if existing_subject.is_deleted == 1:
-            print(f"Undeleting subject: {payload.subject_name}")
-            existing_subject.is_deleted = 0
-            existing_subject.schedule = payload.schedule
-            new_subject = existing_subject
-        else:
-            print(f"Subject already active: {payload.subject_name}")
-            raise HTTPException(status_code=400, detail="Subject with this name and section already exists")
-    else:
-        print(f"Creating new subject: {payload.subject_name}")
-        new_subject = Subject(
-            subject_name=payload.subject_name,
-            section=payload.section,
-            schedule=payload.schedule,
-            is_deleted=0
-        )
-        db.add(new_subject)
-
-    try:
-        db.commit()
-        db.refresh(new_subject)
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error: {e}")
-
-    return {
-        "subject_id": new_subject.subject_id,
-        "subject_name": new_subject.subject_name,
-        "section": new_subject.section,
-        "schedule": new_subject.schedule,
-        "cover_image_path": new_subject.cover_image_path
-    }
-
-
-@app.delete("/subjects/{subject_id}")
-def delete_subject(subject_id: int, db: Session = Depends(get_db)):
-    subject = db.query(Subject).filter(
-        Subject.subject_id == subject_id,
-        Subject.is_deleted == 0
-    ).first()
-
-    if not subject:
-        raise HTTPException(status_code=404, detail="Subject not found")
-
-    subject.is_deleted = 1
-    db.commit()
-    return {"message": f"Subject {subject_id} ({subject.subject_name}) marked as deleted."}
-
+    class Config:
+        from_attributes = True
 
 class UserCreate(BaseModel):
     student_code: Optional[str] = None
@@ -503,6 +518,50 @@ class UserUpdate(BaseModel):
     student_code: Optional[str] = None
     role: Optional[str] = None
     subject_id: Optional[int] = None
+
+
+@app.get("/subjects", response_model=List[SubjectResponse])
+def list_subjects(db: Session = Depends(get_db)):
+    subjects = db.query(Subject).all()
+    return subjects
+
+
+@app.post("/subjects", response_model=SubjectResponse)
+def create_subject(subject: SubjectCreate, db: Session = Depends(get_db)):
+    existing = db.query(Subject).filter(
+        Subject.subject_name == subject.subject_name,
+        Subject.section == subject.section
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Subject with this name and section already exists")
+    new_subject = Subject(
+        subject_name=subject.subject_name,
+        section=subject.section,
+        schedule=subject.schedule
+    )
+    try:
+        db.add(new_subject);
+        db.commit();
+        db.refresh(new_subject)
+        return new_subject
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/subjects/{subject_id}")
+def delete_subject(subject_id: int, db: Session = Depends(get_db)):
+    subject = db.query(Subject).filter(
+        Subject.subject_id == subject_id,
+        Subject.is_deleted == 0
+    ).first()
+
+    if not subject:
+        raise HTTPException(status_code=404, detail="Subject not found")
+
+    subject.is_deleted = 1
+    db.commit()
+    return {"message": f"Subject {subject_id} ({subject.subject_name}) marked as deleted."}
+
 
 
 @app.post("/users")
@@ -586,24 +645,28 @@ def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db)
 
 @app.delete("/users/{user_id}")
 def delete_user(user_id: int, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.user_id == user_id, User.is_deleted == 0).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    user.is_deleted = 1
-    db.commit()
+    user = db.query(User).options(selectinload(User.faces)).filter(User.user_id == user_id,
+                                                                   User.is_deleted == 0).first()
+    if not user: raise HTTPException(status_code=404, detail="User not found")
+    user_face_dir = os.path.join(MEDIA_ROOT, str(user_id))
     try:
-        train_refresh(db)
+        if user.faces:
+            for face in user.faces: db.delete(face)
+        user.is_deleted = 1
+        if user.student_code: user.student_code = f"{user.student_code}_deleted_{int(time.time())}"
+        db.commit()
+        if os.path.isdir(user_face_dir): shutil.rmtree(user_face_dir)
     except Exception as e:
-        print(f"Warning: train_refresh failed after deleting user: {e}")
-
-    return {"message": f"User {user_id} ({user.name}) marked as deleted."}
+        db.rollback();
+        raise HTTPException(status_code=500, detail=f"Failed to delete user data: {e}")
+    return {"message": f"User {user_id} ({user.name}) marked as deleted and all face data removed."}
 
 
 @app.delete("/faces/{face_id}")
 def delete_face(face_id: int, db: Session = Depends(get_db)):
     face = db.query(UserFace).filter(UserFace.face_id == face_id).first()
     if not face:
-        raise HTTPException(status_code=4404, detail="Face image not found")
+        raise HTTPException(status_code=404, detail="Face image not found")
     try:
         file_path = os.path.join(MEDIA_ROOT, str(face.user_id), face.file_path)
         db.delete(face);
@@ -619,6 +682,83 @@ def delete_face(face_id: int, db: Session = Depends(get_db)):
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to delete face: {e}")
+
+
+@app.get("/attendance/export")
+def export_attendance_logs(
+        subject_id: Optional[int] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        db: Session = Depends(get_db)
+):
+    query = (
+        db.query(
+            AttendanceLog.user_id,
+            User.name.label("user_name"),
+            User.student_code,
+            AttendanceLog.subject_id,
+            Subject.subject_name,
+            func.date(AttendanceLog.timestamp).label("log_date"),
+            AttendanceLog.action,
+            AttendanceLog.timestamp,
+            AttendanceLog.snapshot_path
+        )
+        .outerjoin(User, AttendanceLog.user_id == User.user_id)
+        .outerjoin(Subject, AttendanceLog.subject_id == Subject.subject_id)
+        .filter(User.is_deleted != 1)
+        .order_by(AttendanceLog.user_id, AttendanceLog.timestamp.asc())
+    )
+
+    if subject_id:
+        query = query.filter(AttendanceLog.subject_id == subject_id)
+    if start_date:
+        query = query.filter(func.date(AttendanceLog.timestamp) >= start_date)
+    if end_date:
+        query = query.filter(func.date(AttendanceLog.timestamp) <= end_date)
+
+    logs = query.all()
+
+    grouped = {}
+    for log in logs:
+        key = (log.user_id if log.user_id else 'UNKNOWN', log.log_date)
+        grouped.setdefault(key, []).append(log)
+
+    results = []
+    for (uid, log_date), entries in grouped.items():
+        ins = [e for e in entries if e.action.lower() == "enter"]
+        outs = [e for e in entries if e.action.lower() == "exit"]
+
+        if not ins:
+            continue
+
+        in_log = ins[0]
+        in_time = in_log.timestamp
+        out_time = outs[-1].timestamp if outs else None
+
+        duration = timedelta(0)
+        if out_time:
+            duration = out_time - in_time
+
+        user_name = entries[0].user_name if entries[0].user_name else "Unknown User"
+        student_code = entries[0].student_code if entries[0].student_code else "N/A"
+
+        snapshot_path = getattr(in_log, "snapshot_path", None)
+
+        results.append({
+            "user_id": uid,
+            "user_name": user_name,
+            "student_code": student_code,
+            "subject_id": entries[0].subject_id,
+            "subject_name": entries[0].subject_name if entries[0].subject_name else "N/A",
+            "date": log_date.isoformat(),
+            "in_time": in_time.isoformat(),
+            "out_time": out_time.isoformat() if out_time else None,
+            "duration_minutes": round(duration.total_seconds() / 60, 2),
+            "status": "Present" if out_time else "No Exit",
+            "snapshot_path": snapshot_path
+        })
+
+    return JSONResponse(content=results)
 
 
 # --- 9. Uvicorn Runner ---

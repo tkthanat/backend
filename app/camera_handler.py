@@ -8,6 +8,8 @@ from glob import glob
 from typing import Dict, Optional, List, Any, Set
 from dataclasses import dataclass, field
 
+import numpy as np
+
 from .ai_engine import annotate_and_match
 
 
@@ -26,12 +28,12 @@ class CameraSource:
     last_frame: Optional[bytes] = None
     _thread: Optional[threading.Thread] = field(default=None, repr=False)
     _stop: bool = field(default=False, repr=False)
-
     ai_queue: queue.Queue = field(default_factory=queue.Queue, repr=False)
     _ai_thread: Optional[threading.Thread] = field(default=None, repr=False)
-
     last_ai_result: List[Dict[str, Any]] = field(default_factory=list)
     is_ai_paused: bool = True
+
+    cap_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
 class CameraManager:
@@ -48,10 +50,6 @@ class CameraManager:
         self.checked_in_session: Dict[str, Set[str]] = {}
         self.check_in_queue = queue.Queue()
 
-        # ✨ [ แก้ไข ] เพิ่ม 2 State นี้
-        self.active_roster: Optional[Set[int]] = None
-        self.active_subject_id: Optional[int] = None  # (เพิ่มตัวแปรนี้)
-
     def _open_cap(self, src: str) -> cv2.VideoCapture:
         backend = _backend_flag()
         if src.isdigit():
@@ -65,87 +63,111 @@ class CameraManager:
     def open(self, cam_id: str):
         cam = self.sources.get(cam_id)
         if not cam: raise KeyError(f"camera '{cam_id}' not found")
-        if cam.is_open: return
 
-        try:
-            cam.cap = self._open_cap(cam.src)
-            if not cam.cap or not cam.cap.isOpened():
-                raise RuntimeError(f"Cannot open camera '{cam_id}' ({cam.src})")
-        except Exception as e:
-            print(f"Failed to open cap for {cam_id}: {e}")
-            self.close(cam_id)
-            raise e
+        with cam.cap_lock:
+            if cam.is_open: return
 
-        cam.is_open = True
-        cam._stop = False
-        cam.ai_queue = queue.Queue(maxsize=1)
+            try:
+                cam.cap = self._open_cap(cam.src)
+                if not cam.cap or not cam.cap.isOpened():
+                    raise RuntimeError(f"Cannot open camera '{cam_id}' ({cam.src})")
+            except Exception as e:
+                print(f"Failed to open cap for {cam_id}: {e}")
+                cam.cap = None
+                raise e
 
-        self.attendance_trackers[cam_id] = {}
-        self.checked_in_session[cam_id] = set()
+            cam.is_open = True
+            cam._stop = False
+            cam.ai_queue = queue.Queue(maxsize=1)
 
-        cam._thread = threading.Thread(target=self._loop_stream, args=(cam,), daemon=True)
-        cam._thread.start()
-        cam._ai_thread = threading.Thread(target=self._loop_ai, args=(cam,), daemon=True)
-        cam._ai_thread.start()
-        print(f"[CameraManager] Opened camera {cam_id} (Src: {cam.src})")
+            self.attendance_trackers[cam_id] = {}
+            self.checked_in_session[cam_id] = set()
+
+            cam._thread = threading.Thread(target=self._loop_stream, args=(cam,), daemon=True)
+            cam._thread.start()
+            cam._ai_thread = threading.Thread(target=self._loop_ai, args=(cam,), daemon=True)
+            cam._ai_thread.start()
+            print(f"[CameraManager] Opened camera {cam_id} (Src: {cam.src})")
 
     def close(self, cam_id: str):
         cam = self.sources.get(cam_id)
         if not cam: return
-        if not cam.is_open and not cam._thread and not cam._ai_thread:
-            return
 
-        print(f"[CameraManager] Closing camera {cam_id}...")
-        cam._stop = True
+        with cam.cap_lock:
+            if not cam.is_open: return
 
-        if cam.ai_queue:
-            try:
-                cam.ai_queue.put_nowait(None)
-            except queue.Full:
-                pass
+            print(f"[CameraManager] Closing camera {cam_id}...")
+            cam._stop = True
 
-        if cam._thread and cam._thread.is_alive():
-            cam._thread.join(timeout=1.0)
-        if cam._ai_thread and cam._ai_thread.is_alive():
-            cam._ai_thread.join(timeout=1.0)
+            if cam.ai_queue:
+                try:
+                    cam.ai_queue.put_nowait(None)
+                except queue.Full:
+                    pass
 
-        if cam.cap:
-            try:
-                cam.cap.release()
-                print(f"[CameraManager] Released cap for {cam_id}")
-            except Exception as e:
-                print(f"Error releasing cap for {cam_id}: {e}")
+            if cam._thread and cam._thread.is_alive():
+                cam._thread.join(timeout=1.0)
+                if cam._thread.is_alive():
+                    print(f"[WARN] Stream worker {cam.cam_id} failed to join.")
 
-        cam.cap = None
-        cam.is_open = False
-        cam._thread = None
-        cam._ai_thread = None
-        self.attendance_trackers.pop(cam_id, None)
-        self.checked_in_session.pop(cam_id, None)
-        print(f"[CameraManager] Successfully closed camera {cam_id}")
+            if cam._ai_thread and cam._ai_thread.is_alive():
+                cam._ai_thread.join(timeout=1.0)
+                if cam._ai_thread.is_alive():
+                    print(f"[WARN] AI worker {cam.cam_id} failed to join.")
+
+            if cam.cap:
+                try:
+                    cam.cap.release()
+                    print(f"[CameraManager] Released cap for {cam_id}")
+                except Exception as e:
+                    print(f"Error releasing cap for {cam_id}: {e}")
+
+            cam.cap = None
+            cam.is_open = False
+            cam._thread = None
+            cam._ai_thread = None
+
+            self.attendance_trackers.pop(cam_id, None)
+            self.checked_in_session.pop(cam_id, None)
+
+            print(f"[CameraManager] Successfully closed camera {cam_id}")
 
     def _loop_stream(self, cam: CameraSource):
         print(f"[Stream Worker {cam.cam_id}] Started...")
-        while not cam._stop and cam.cap and cam.cap.isOpened():
+        while not cam._stop:
             start_time = time.time()
-            if not cam.cap: break
-            ok, frame = cam.cap.read()
-            if not ok or frame is None:
-                print(f"[Stream Worker {cam.cam_id}] Frame read error.")
-                time.sleep(0.1)
-                continue
 
-            ok2, jpg = cv2.imencode(".jpg", frame)
-            if ok2:
-                cam.last_frame = jpg.tobytes()
+            frame = None
             try:
-                cam.ai_queue.put_nowait(frame.copy())
-            except queue.Full:
-                pass
-            processing_time = time.time() - start_time
-            sleep_time = self.interval - processing_time
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+                with cam.cap_lock:
+                    if not cam.is_open or not cam.cap or not cam.cap.isOpened():
+                        break
+                    ok, frame = cam.cap.read()
+
+                if not ok or frame is None:
+                    print(f"[Stream Worker {cam.cam_id}] Frame read error.")
+                    time.sleep(0.1)
+                    continue
+
+                ok2, jpg = cv2.imencode(".jpg", frame)
+                if ok2:
+                    cam.last_frame = jpg.tobytes()
+                try:
+                    cam.ai_queue.put_nowait(frame.copy())
+                except queue.Full:
+                    pass
+
+                processing_time = time.time() - start_time
+                sleep_time = self.interval - processing_time
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+            except Exception as e:
+                print(f"[Stream Worker {cam.cam_id}] Loop Error: {e}")
+                if cam._stop:
+                    break
+                time.sleep(0.5)
+
         print(f"[Stream Worker {cam.cam_id}] Stopped.")
 
     def _loop_ai(self, cam: CameraSource):
@@ -159,10 +181,13 @@ class CameraManager:
         while not cam._stop:
             try:
                 frame = cam.ai_queue.get(timeout=1.0)
-                if frame is None: break
+                if frame is None:
+                    break
+
                 if cam.is_ai_paused:
                     cam.last_ai_result = []
-                    if trackers: trackers.clear()
+                    if trackers:
+                        trackers.clear()
                     continue
 
                 ai_results = annotate_and_match(frame)
@@ -176,19 +201,11 @@ class CameraManager:
                         name = res.get("name")
                         user_id = res.get("user_id")
                         if name == "Unknown" or not user_id: continue
-
-                        # (Logic ตรวจสอบ Roster - เหมือนเดิม)
-                        if self.active_roster is not None and user_id not in self.active_roster:
-                            res["display_name"] = f"{name} (Not in class)"
-                            continue
-
                         seen_in_frame.add(name)
                         if name in checked_in: continue
 
                         if name not in trackers:
                             trackers[name] = current_time
-                            print(
-                                f"👀 [AI Tracker] '{name}' seen on {cam.cam_id}. Starting {self.CHECK_IN_DURATION}s timer...")
                         else:
                             duration = current_time - trackers[name]
                             if duration >= self.CHECK_IN_DURATION:
@@ -196,15 +213,18 @@ class CameraManager:
                                 check_in_data = {
                                     "user_id": user_id, "name": name,
                                     "action": current_action, "timestamp": current_time,
-                                    "confidence": res.get("similarity")
+                                    "confidence": res.get("similarity"),
+                                    "frame": frame  # (โค้ดนี้ถูกต้องแล้ว)
                                 }
                                 self.check_in_queue.put(check_in_data)
                                 print(f"✅ [ATTENDANCE] Checked in: {name} (Action: {current_action})")
                                 trackers.pop(name, None)
 
+                                if current_action == "exit":
+                                    self.reset_user_session(name)
+
                 lost_names = set(trackers.keys()) - seen_in_frame
                 for name in lost_names:
-                    print(f"❌ [AI Tracker] '{name}' lost on {cam.cam_id}. Resetting timer.")
                     trackers.pop(name, None)
 
             except queue.Empty:
@@ -238,13 +258,34 @@ class CameraManager:
         return [{"cam_id": c.cam_id, "src": c.src, "is_open": c.is_open} for c in self.sources.values()]
 
     def reconfigure(self, new_sources: Dict[str, str]):
-        for k in list(self.sources.keys()):
-            self.close(k)
-        time.sleep(1.0)
-        self.sources = {k: CameraSource(k, v) for k, v in new_sources.items()}
-        print(f"Reconfigured. New sources: {self.sources}")
+        print(f"Reconfiguring... New sources: {new_sources}")
+        for cam_id, new_src in new_sources.items():
+            if cam_id in self.sources:
+                cam = self.sources[cam_id]
+                if cam.src != new_src or not cam.is_open:
+                    print(f"Source changed for {cam_id}: {cam.src} -> {new_src}. Reconnecting...")
+                    self.close(cam_id)
+                    cam.src = new_src
+            else:
+                self.sources[cam_id] = CameraSource(cam_id, new_src)
 
-    # ✨ [ แก้ไข ] เพิ่ม subject_id เข้ามา
+        print(f"Reconfigure complete. Current sources: {self.sources}")
+
+    # ✨ [แก้ไข] เพิ่มฟังก์ชันนี้เข้ามา
+    def reset_user_session(self, user_name: str):
+        """
+        ลบ user ออกจาก 'checked_in_session' ของกล้อง *ทั้งหมด*
+        เพื่อให้ user นี้สามารถ check-in (enter) ใหม่ได้
+        """
+        print(f"[Session] Resetting session for user: {user_name}")
+        for cam_id, session_set in self.checked_in_session.items():
+            if user_name in session_set:
+                try:
+                    session_set.remove(user_name)
+                    print(f"[Session] Removed {user_name} from {cam_id} session.")
+                except KeyError:
+                    pass  # (อาจจะเกิด Race Condition แต่ไม่เป็นไร)
+
     def set_active_roster(self, user_ids: Optional[Set[int]], subject_id: Optional[int]):
         """
         อัปเดต Roster (บัญชีรายชื่อ) และ Subject ID ที่กำลัง Active
@@ -272,7 +313,15 @@ class CameraManager:
             return True
         return False
 
+    def get_latest_frame(self):
+        for cam in self.sources.values():
+            if cam.is_open and cam.last_frame:
+                npimg = np.frombuffer(cam.last_frame, np.uint8)
+                return cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+        return None
 
+
+# (ฟังก์ชัน discover_local_devices อยู่นอก Class ถูกต้องแล้ว)
 def discover_local_devices(
         max_index: int = 10,
         test_frame: bool = True,
@@ -280,8 +329,10 @@ def discover_local_devices(
 ) -> List[dict]:
     if exclude_srcs is None:
         exclude_srcs = []
+
     devices: List[dict] = []
     backend = _backend_flag()
+
     candidates: List[str] = []
     if platform.system() == "Linux":
         vids = sorted(glob("/dev/video*"))
@@ -311,11 +362,20 @@ def discover_local_devices(
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if opened else 0
         ok_frame = False
         if opened and test_frame:
-            ok, frame = cap.read()
-            ok_frame = bool(ok and frame is not None)
+            try:
+                ok, frame = cap.read()
+                ok_frame = bool(ok and frame is not None)
+            except Exception as e:
+                print(f"Failed to read frame from {src}: {e}")
+                ok_frame = False
         if cap: cap.release()
-        devices.append({
-            "src": src, "opened": opened, "readable": ok_frame,
-            "width": w, "height": h, "in_use": False
-        })
+
+        if opened and ok_frame:
+            devices.append({
+                "src": src, "opened": opened, "readable": ok_frame,
+                "width": w, "height": h, "in_use": False
+            })
+        else:
+            print(f"Skipping non-readable device src {src}.")
+
     return devices

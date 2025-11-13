@@ -141,6 +141,7 @@ def annotate_and_match(frame: np.ndarray) -> List[Dict[str, Any]]:
             matched = False
             uid = None
 
+        # คำนวณ w, h
         w = x2 - x1
         h = y2 - y1
 
