@@ -14,11 +14,9 @@ from collections import defaultdict
 
 import pandas as pd
 
-# --- [ 1. เพิ่ม IMPORTS เหล่านี้ ] ---
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as OpenPyXLImage
 from PIL import Image as PILImage
-# ---------------------------------
 
 from .db_models import get_db, UserFace, User, AttendanceLog, Subject, UserType
 from .camera_handler import CameraManager, discover_local_devices
@@ -89,11 +87,13 @@ async def upload_faces(user_id: int = Form(...), images: list[UploadFile] = File
     return {"saved": saved, "items": items}
 
 
+# --- [ ⭐️⭐️⭐️ นี่คือฟังก์ชันที่แก้ไข ⭐️⭐️⭐️ ] ---
 @app.post("/train/refresh")
 def train_refresh(db: Session = Depends(get_db)):
     rows = (
         db.query(UserFace.user_id, UserFace.file_path, User.name)
-        .join(User, User.user_id == User.user_id).all()
+        # ( ⭐️ แก้ไขเงื่อนไข .join() ที่นี่ ⭐️ )
+        .join(User, User.user_id == UserFace.user_id).all()
     )
     users, total = refresh_facebank_from_db(rows)
     cnt = load_facebank()
@@ -231,7 +231,7 @@ def set_camera_config(mapping: dict = Body(..., example={"entrance": "0", "exit"
     return {"message": "camera mapping updated", "mapping": mapping}
 
 
-# --- 6. Attendance API Endpoints (เหมือนเดิม) ---
+# --- 6. Attendance API Endpoints ---
 class ActiveSubjectPayload(BaseModel):
     subject_id: Optional[int] = None
 
@@ -281,7 +281,11 @@ async def get_attendance_events(db: Session = Depends(get_db)):
         User.user_id.in_(user_ids_to_check)).all()
     user_info_map = {u.user_id: u for u in users_data}
     active_subject_id = cam_mgr.active_subject_id
-
+    active_rule_time: Optional[dt_time] = None
+    if active_subject_id:
+        subject = db.query(Subject.class_start_time).filter(Subject.subject_id == active_subject_id).first()
+        if subject and subject.class_start_time:
+            active_rule_time = subject.class_start_time
     for event in events:
         user_id = event.get("user_id")
         if not user_id or user_id not in user_info_map:
@@ -292,17 +296,14 @@ async def get_attendance_events(db: Session = Depends(get_db)):
             log_subject_id = active_subject_id
         else:
             log_subject_id = user_info.subject_id
-
         event_timestamp = datetime.fromtimestamp(event["timestamp"])
         last_log = db.query(AttendanceLog).filter(
             AttendanceLog.user_id == user_id
         ).order_by(AttendanceLog.timestamp.desc()).first()
-
         can_log = False
         time_since_last_log = timedelta(days=1)
         if last_log:
             time_since_last_log = event_timestamp - last_log.timestamp
-
         if not last_log:
             if event["action"].lower() == "enter":
                 can_log = True
@@ -319,16 +320,25 @@ async def get_attendance_events(db: Session = Depends(get_db)):
             elif last_log.action.lower() == "exit":
                 if time_since_last_log >= timedelta(seconds=COOLDOWN_SECONDS):
                     can_log = True
-
         if can_log:
+            log_status: Optional[str] = None
+            log_rule: Optional[dt_time] = None
+            if event["action"].lower() == "enter":
+                log_status = "Present"
+                log_rule = active_rule_time
+                if log_rule:
+                    class_start_dt = datetime.combine(event_timestamp.date(), log_rule)
+                    if event_timestamp > class_start_dt:
+                        log_status = "Late"
             new_log_db = AttendanceLog(
                 user_id=user_id,
                 subject_id=log_subject_id,
                 action=event["action"],
                 timestamp=event_timestamp,
-                confidence=event.get("confidence")
+                confidence=event.get("confidence"),
+                log_status=log_status,
+                log_rule_start_time=log_rule
             )
-
             if event["action"].lower() == "enter" and event.get("frame") is not None:
                 os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
                 snap_name = f"{user_id}_{int(time.time())}.jpg"
@@ -340,10 +350,8 @@ async def get_attendance_events(db: Session = Depends(get_db)):
                 except Exception as e:
                     print(f"Error saving snapshot: {e}")
                     new_log_db.snapshot_path = None
-
             db.add(new_log_db)
             db.flush()
-
             new_logs_for_frontend.append({
                 "log_id": new_log_db.log_id,
                 "user_id": user_id,
@@ -354,8 +362,8 @@ async def get_attendance_events(db: Session = Depends(get_db)):
                 "confidence": event.get("confidence"),
                 "subject_id": log_subject_id,
                 "snapshot_path": getattr(new_log_db, "snapshot_path", None),
+                "log_status": log_status,
             })
-
     if new_logs_for_frontend:
         db.commit()
     return new_logs_for_frontend
@@ -388,12 +396,13 @@ async def get_attendance_logs(
             "timestamp": log.timestamp.isoformat(), "confidence": log.confidence,
             "user_name": user_name or "N/A", "student_code": student_code or "N/A",
             "subject_name": subject_name or None,
-            "snapshot_path": log.snapshot_path if hasattr(log, 'snapshot_path') else None
+            "snapshot_path": log.snapshot_path if hasattr(log, 'snapshot_path') else None,
+            "log_status": log.log_status,
+            "log_rule_start_time": log.log_rule_start_time,
         })
     return results
 
 
-# --- [ ⭐️⭐️⭐️ นี่คือฟังก์ชันที่แก้ไข ⭐️⭐️⭐️ ] ---
 @app.get("/attendance/export")
 async def export_attendance_logs(
         start_date: Optional[date] = None,
@@ -410,8 +419,9 @@ async def export_attendance_logs(
             Subject.subject_name.label("Subject"),
             Subject.section.label("Section"),
             AttendanceLog.action.label("Action"),
+            AttendanceLog.log_status.label("Status"),
+            AttendanceLog.log_rule_start_time.label("RuleTime"),
             AttendanceLog.confidence.label("Confidence"),
-            # --- [ 2. เพิ่มคอลัมน์นี้ใน QUERY ] ---
             AttendanceLog.snapshot_path.label("SnapshotPath")
         )
         .outerjoin(User, AttendanceLog.user_id == User.user_id)
@@ -423,131 +433,76 @@ async def export_attendance_logs(
     if start_date: query = query.filter(func.date(AttendanceLog.timestamp) >= start_date)
     if end_date: query = query.filter(func.date(AttendanceLog.timestamp) <= end_date)
     if subject_id is not None: query = query.filter(AttendanceLog.subject_id == subject_id)
-
     logs = query.all()
-
     output = io.BytesIO()
     filename = f"attendance_export_{start_date or 'all'}_to_{end_date or 'all'}"
-
+    headers_excel = ["Timestamp", "StudentCode", "Name", "Subject", "Section", "Action", "Status", "RuleTime",
+                     "Confidence", "Snapshot"]
+    headers_csv = ["Timestamp", "StudentCode", "Name", "Subject", "Section", "Action", "Status", "RuleTime",
+                   "Confidence", "SnapshotPath"]
     if format.lower() == 'xlsx':
-        # --- [ 3. นี่คือ BLOCK ที่แทนที่ของเดิม ] ---
-
         wb = Workbook()
         ws = wb.active
         ws.title = "Attendance"
-
-        # 3.1 สร้าง Headers
-        headers = ["Timestamp", "StudentCode", "Name", "Subject", "Section", "Action", "Confidence", "Snapshot"]
-        ws.append(headers)
-
-        # 3.2 ปรับความกว้างคอลัมน์ (เลือกได้)
-        ws.column_dimensions['A'].width = 22  # Timestamp
-        ws.column_dimensions['B'].width = 15  # StudentCode
-        ws.column_dimensions['C'].width = 25  # Name
-        ws.column_dimensions['D'].width = 20  # Subject
-        ws.column_dimensions['E'].width = 10  # Section
-        ws.column_dimensions['F'].width = 10  # Action
-        ws.column_dimensions['G'].width = 12  # Confidence
-        ws.column_dimensions['H'].width = 20  # Snapshot (กว้าง)
-
+        ws.append(headers_excel)
+        ws.column_dimensions['A'].width = 22;
+        ws.column_dimensions['B'].width = 15;
+        ws.column_dimensions['C'].width = 25;
+        ws.column_dimensions['D'].width = 20;
+        ws.column_dimensions['E'].width = 10;
+        ws.column_dimensions['F'].width = 10;
+        ws.column_dimensions['G'].width = 10;
+        ws.column_dimensions['H'].width = 10;
+        ws.column_dimensions['I'].width = 12;
+        ws.column_dimensions['J'].width = 20
         if not logs:
-            ws.append(["No data found for the selected filters."] + [""] * 7)
+            ws.append(["No data found for the selected filters."] + [""] * 9)
         else:
-            # 3.3 วนลูปข้อมูลและเพิ่มลงใน Excel
             for idx, log in enumerate(logs):
-                row_num = idx + 2  # (1-based index, +1 สำหรับ header)
-
-                # Format timestamp (เพื่อให้เหมือนกับที่ pandas เคยทำ)
+                row_num = idx + 2
                 timestamp_str = pd.to_datetime(log.Timestamp).tz_localize(None).strftime('%Y-%m-%d %H:%M:%S')
-
-                # เพิ่มข้อมูลตัวอักษร
-                ws.append([
-                    timestamp_str,
-                    log.StudentCode,
-                    log.Name,
-                    log.Subject,
-                    log.Section,
-                    log.Action,
-                    log.Confidence,
-                    ""  # เว้นไว้สำหรับรูปภาพ
-                ])
-
-                # 3.4 ปรับความสูงของแถว
-                ws.row_dimensions[row_num].height = 65  # (ประมาณ 80px)
-
-                # 3.5 (ส่วนสำคัญ) เพิ่มรูปภาพ
+                rule_time_str = log.RuleTime.isoformat() if log.RuleTime else ""
+                ws.append([timestamp_str, log.StudentCode, log.Name, log.Subject, log.Section, log.Action, log.Status,
+                           rule_time_str, log.Confidence, ""])
+                ws.row_dimensions[row_num].height = 65
                 if log.SnapshotPath and os.path.exists(log.SnapshotPath):
                     try:
-                        # ใช้ Pillow เปิดและย่อขนาด
                         pil_img = PILImage.open(log.SnapshotPath)
-
-                        # ย่อขนาด (กำหนดความสูง 80px, ความกว้างอัตโนมัติ)
-                        target_height = 80
-                        width_percent = (target_height / float(pil_img.size[1]))
-                        target_width = int((float(pil_img.size[0]) * float(width_percent)))
-
+                        target_height = 80;
+                        width_percent = (target_height / float(pil_img.size[1]));
+                        target_width = int((float(pil_img.size[0]) * float(width_percent)));
                         pil_img = pil_img.resize((target_width, target_height), PILImage.LANCZOS)
-
-                        # เซฟลง memory ชั่วคราว
-                        img_io = io.BytesIO()
-                        pil_img.save(img_io, format='PNG')
+                        img_io = io.BytesIO();
+                        pil_img.save(img_io, format='PNG');
                         img_io.seek(0)
-
                         img_for_excel = OpenPyXLImage(img_io)
-
-                        # แปะรูปลงใน Cell
-                        ws.add_image(img_for_excel, f"H{row_num}")
-
+                        ws.add_image(img_for_excel, f"J{row_num}")
                     except Exception as e:
                         print(f"Error processing image {log.SnapshotPath}: {e}")
-                        ws[f"H{row_num}"] = "Error: Img"
+                        ws[f"J{row_num}"] = "Error: Img"
                 else:
-                    ws[f"H{row_num}"] = "N/A"
-
-        # 3.6 เซฟ Workbook ลงใน output
+                    ws[f"J{row_num}"] = "N/A"
         wb.save(output)
-
-        # --- [ สิ้นสุดการแทนที่ ] ---
-
         media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         filename += ".xlsx"
-
-    else:  # (format.lower() == 'csv')
-        # --- [ 4. นี่คือ ELSE BLOCK ที่แทนที่ของเดิม ] ---
-
+    else:
         if not logs:
-            df = pd.DataFrame(columns=["Timestamp", "StudentCode", "Name", "Subject", "Section", "Action", "Confidence",
-                                       "SnapshotPath"])
-            df.loc[0] = ["No data found for the selected filters."] + [""] * 7
+            df = pd.DataFrame(columns=headers_csv)
+            df.loc[0] = ["No data found for the selected filters."] + [""] * 9
         else:
-            # แปลง logs (SQLAlchemy Row) เป็น list of dicts
             log_dicts = [log._asdict() for log in logs]
             df = pd.DataFrame(log_dicts)
-
-            # จัดเรียงคอลัมน์ (CSV จะมี Path ของรูปแทน)
-            cols_in_order = ["Timestamp", "StudentCode", "Name", "Subject", "Section", "Action", "Confidence",
-                             "SnapshotPath"]
-            df = df[cols_in_order]
-
+            df = df[headers_csv]
             if 'Timestamp' in df.columns:
                 df['Timestamp'] = pd.to_datetime(df['Timestamp']).dt.tz_localize(None)
-
         df.to_csv(output, index=False, encoding='utf-8')
-        # --- [ สิ้นสุดการแทนที่ ] ---
-
         media_type = "text/csv"
         filename += ".csv"
-
     return Response(
         content=output.getvalue(),
         media_type=media_type,
-        headers={
-            "Content-Disposition": f"attachment; filename={filename}"
-        }
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
-
-
-# --- [ ⭐️⭐️⭐️ สิ้นสุดฟังก์ชันที่แก้ไข ⭐️⭐️⭐️ ] ---
 
 
 @app.post("/attendance/clear/{cam_id}")
@@ -592,7 +547,6 @@ async def create_subject(
         Subject.section == payload.section,
         Subject.academic_year == payload.academic_year
     ).first()
-
     if existing_subject:
         if existing_subject.is_deleted == 1:
             print(f"Undeleting subject: {payload.subject_name}")
@@ -623,16 +577,11 @@ async def create_subject(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
-
     return {
-        "subject_id": new_subject.subject_id,
-        "subject_name": new_subject.subject_name,
-        "section": new_subject.section,
-        "schedule": new_subject.schedule,
-        "cover_image_path": new_subject.cover_image_path,
-        "academic_year": new_subject.academic_year,
-        "class_start_time": new_subject.class_start_time,
-        "class_end_time": new_subject.class_end_time,
+        "subject_id": new_subject.subject_id, "subject_name": new_subject.subject_name,
+        "section": new_subject.section, "schedule": new_subject.schedule,
+        "cover_image_path": new_subject.cover_image_path, "academic_year": new_subject.academic_year,
+        "class_start_time": new_subject.class_start_time, "class_end_time": new_subject.class_end_time,
     }
 
 
@@ -666,8 +615,7 @@ class SubjectTimeUpdate(BaseModel):
 def update_subject_time(subject_id: int, payload: SubjectTimeUpdate, db: Session = Depends(get_db)):
     subject = db.query(Subject).filter(Subject.subject_id == subject_id).first()
     if not subject:
-        raise HTTPException(status_code=44, detail="Subject not found")
-
+        raise HTTPException(status_code=404, detail="Subject not found")
     try:
         subject.class_start_time = payload.class_start_time
         db.commit()
@@ -681,18 +629,18 @@ def update_subject_time(subject_id: int, payload: SubjectTimeUpdate, db: Session
 
 
 class UserCreate(BaseModel):
-    student_code: Optional[str] = None
+    student_code: Optional[str] = None;
     name: str;
     role: str
-    user_type_id: Optional[int] = None
-    subject_id: Optional[int] = None
+    user_type_id: Optional[int] = None;
+    subject_id: Optional[int] = None;
     password_hash: Optional[str] = None
 
 
 class UserUpdate(BaseModel):
-    name: Optional[str] = None
+    name: Optional[str] = None;
     student_code: Optional[str] = None
-    role: Optional[str] = None
+    role: Optional[str] = None;
     subject_id: Optional[int] = None
 
 
@@ -705,12 +653,8 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db)):
         if existing:
             raise HTTPException(status_code=400, detail=f"Student code '{payload.student_code}' already exists.")
     user = User(
-        student_code=payload.student_code,
-        name=payload.name,
-        role=payload.role,
-        user_type_id=payload.user_type_id,
-        subject_id=payload.subject_id,
-        password_hash=payload.password_hash,
+        student_code=payload.student_code, name=payload.name, role=payload.role,
+        user_type_id=payload.user_type_id, subject_id=payload.subject_id, password_hash=payload.password_hash,
     )
     db.add(user);
     db.commit();
@@ -739,10 +683,7 @@ def list_users(
             "name": u.name, "role": u.role,
             "user_type_id": u.user_type_id,
             "subject_id": u.subject_id,
-            "faces": [
-                {"face_id": f.face_id, "file_path": f.file_path}
-                for f in u.faces
-            ]
+            "faces": [{"face_id": f.face_id, "file_path": f.file_path} for f in u.faces]
         })
     return results
 
@@ -754,17 +695,17 @@ def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db)
         raise HTTPException(status_code=404, detail="User not found")
     updated = False
     if payload.name is not None:
-        user.name = payload.name
+        user.name = payload.name;
         updated = True
     if payload.student_code is not None:
         if payload.student_code != user.student_code:
             existing = db.query(User).filter(User.student_code == payload.student_code, User.is_deleted == 0).first()
             if existing:
                 raise HTTPException(status_code=400, detail=f"Student code '{payload.student_code}' already exists.")
-        user.student_code = payload.student_code
+        user.student_code = payload.student_code;
         updated = True
     if payload.subject_id is not None:
-        user.subject_id = payload.subject_id if payload.subject_id else None
+        user.subject_id = payload.subject_id if payload.subject_id else None;
         updated = True
     if updated:
         db.commit()
@@ -816,110 +757,61 @@ def delete_face(face_id: int, db: Session = Depends(get_db)):
 
 
 # --- 8. Faculty Dashboard Endpoints ---
-
-# [ ⭐️ ย้ายมาไว้ตรงนี้ ⭐️ ]
-# Pydantic Models to match React's 'page.tsx' interfaces
-class ISubjectResponse(BaseModel):
-    id: str
-    name: str
+class ISubjectResponse(BaseModel): id: str; name: str
 
 
-class ISemesterKPIs(BaseModel):
-    totalRoster: int
-    avgAttendance: float
-    avgLateness: float
-    sessionsTaught: int
+class ISemesterKPIs(BaseModel): totalRoster: int; avgAttendance: float; avgLateness: float; sessionsTaught: int
 
 
-class ITrendDataset(BaseModel):
-    label: str
-    data: List[float]
-    borderColor: str
-    fill: bool
+class ITrendDataset(BaseModel): label: str; data: List[float]; borderColor: Optional[str] = None; fill: Optional[
+    bool] = False; backgroundColor: Optional[str] = None
 
 
-class ITrendGraph(BaseModel):
-    labels: List[str]
-    datasets: List[ITrendDataset]
+class ITrendGraph(BaseModel): labels: List[str]; datasets: List[ITrendDataset]
 
 
-class IStudentAtRisk(BaseModel):
-    studentId: str
-    name: str
-    absences: int
-    lates: int
+class IStudentAtRisk(BaseModel): studentId: str; name: str; absences_percent: float; lates_percent: float
 
 
-class ISemesterOverviewData(BaseModel):
-    kpis: ISemesterKPIs
-    trendGraph: ITrendGraph
-    studentsAtRisk: List[IStudentAtRisk]
+class ISemesterOverviewData(BaseModel): kpis: ISemesterKPIs; trendGraph: ITrendGraph; studentsAtRisk: List[
+    IStudentAtRisk]
 
 
-class ISessionKPIs(BaseModel):
-    present: int
-    total: int
-    absent: int
-    late: int
+class ISessionKPIs(BaseModel): present: int; total: int; absent: int; late: int
 
 
-class ISummaryDonutDataset(BaseModel):
-    data: List[int]
-    backgroundColor: List[str]
+class ISummaryDonutDataset(BaseModel): data: List[int]; backgroundColor: List[str]
 
 
-class ISummaryDonut(BaseModel):
-    labels: List[str]
-    datasets: List[ISummaryDonutDataset]
+class ISummaryDonut(BaseModel): labels: List[str]; datasets: List[ISummaryDonutDataset]
 
 
-class IArrivalHistogramDataset(BaseModel):
-    label: str
-    data: List[int]
-    backgroundColor: str
+class IArrivalHistogramDataset(BaseModel): label: str; data: List[float]; backgroundColor: str
 
 
-class IArrivalHistogram(BaseModel):
-    labels: List[str]
-    datasets: List[IArrivalHistogramDataset]
+class IArrivalHistogram(BaseModel): labels: List[str]; datasets: List[IArrivalHistogramDataset]
 
 
-class ILiveDataEntry(BaseModel):
-    studentId: str
-    name: str
-    status: str  # "Present" | "Late" | "Absent"
-    checkIn: Optional[str] = None
-    checkOut: Optional[str] = None
-    duration: Optional[str] = None
+class ILiveDataEntry(BaseModel): studentId: str; name: str; status: str; checkIn: Optional[str] = None; checkOut: \
+Optional[str] = None; duration: Optional[str] = None
 
 
-class ISessionViewData(BaseModel):
-    kpis: ISessionKPIs
-    summaryDonut: ISummaryDonut
-    arrivalHistogram: IArrivalHistogram
-    liveDataTable: List[ILiveDataEntry]
-
-
-# --- [ ⭐️ สิ้นสุดส่วนที่ย้าย ⭐️ ] ---
+class ISessionViewData(
+    BaseModel): kpis: ISessionKPIs; summaryDonut: ISummaryDonut; arrivalHistogram: IArrivalHistogram; liveDataTable: \
+List[ILiveDataEntry]
 
 
 @app.get("/api/faculty/subjects", response_model=List[ISubjectResponse])
 def get_faculty_subjects(db: Session = Depends(get_db)):
-    """
-    [เหมือนเดิม] ดึงข้อมูลวิชาจาก DB จริง (รวม order_by)
-    """
     try:
         subjects = db.query(Subject).filter(Subject.is_deleted == 0).order_by(Subject.academic_year.desc(),
                                                                               Subject.subject_name).all()
         results = []
         for s in subjects:
             name = f"[{s.academic_year or 'N/A'}] {s.subject_name}"
-            if s.section:
-                name += f" (Sec: {s.section})"
+            if s.section: name += f" (Sec: {s.section})"
             results.append(ISubjectResponse(id=str(s.subject_id), name=name))
-
-        if not results:
-            raise HTTPException(status_code=404, detail="No subjects found. Please create a subject first.")
+        if not results: raise HTTPException(status_code=404, detail="No subjects found. Please create a subject first.")
         return results
     except Exception as e:
         print(f"Database error in get_faculty_subjects: {e}")
@@ -927,20 +819,20 @@ def get_faculty_subjects(db: Session = Depends(get_db)):
                             detail=f"Database query failed. Check if DB schema is up to date. Error: {e}")
 
 
+# --- [ ⭐️⭐️⭐️ 4. แก้ไขฟังก์ชันนี้ (ส่วนอ่าน Dashboard) ⭐️⭐️⭐️ ] ---
 @app.get("/api/faculty/semester-overview", response_model=ISemesterOverviewData)
-def get_semester_overview(subjectId: str, db: Session = Depends(get_db)):
-    """
-    [เหมือนเดิม] คำนวณภาพรวมเทอมจาก Database จริง
-    """
+def get_semester_overview(
+        subjectId: str,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        db: Session = Depends(get_db)
+):
     try:
         subject_id_int = int(subjectId)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid subjectId format.")
 
-    subject = db.query(Subject).filter(Subject.subject_id == subject_id_int).first()
-    if not subject:
-        raise HTTPException(status_code=404, detail="Subject not found.")
-    CLASS_START_TIME = subject.class_start_time or dt_time(9, 0, 0)
+    # (Step 1: ดึง Roster - เหมือนเดิม)
     roster_list = db.query(User).filter(User.subject_id == subject_id_int, User.is_deleted == 0).all()
     kpi_total_roster = len(roster_list)
     roster_map = {u.user_id: u for u in roster_list}
@@ -949,13 +841,40 @@ def get_semester_overview(subjectId: str, db: Session = Depends(get_db)):
             kpis=ISemesterKPIs(totalRoster=0, avgAttendance=0, avgLateness=0, sessionsTaught=0),
             trendGraph=ITrendGraph(labels=[], datasets=[]), studentsAtRisk=[])
 
-    first_log_subquery = (db.query(AttendanceLog.user_id, func.date(AttendanceLog.timestamp).label("log_date"),
-                                   func.min(AttendanceLog.timestamp).label("first_timestamp")).filter(
-        AttendanceLog.user_id.in_(roster_map.keys()), AttendanceLog.action == "enter").group_by(AttendanceLog.user_id,
-                                                                                                func.date(
-                                                                                                    AttendanceLog.timestamp)).subquery())
-    all_first_logs = (db.query(first_log_subquery.c.user_id, first_log_subquery.c.log_date,
-                               first_log_subquery.c.first_timestamp).all())
+    # (Step 2: ดึง Log ภายใน Date Range)
+    # ( ⭐️⭐️⭐️ Logic ใหม่: ดึง "Log แรกของวัน" พร้อม "Status ที่บันทึกไว้" ⭐️⭐️⭐️)
+
+    # 2.1 หา timestamp แรกสุดของแต่ละ (user, date)
+    first_log_subquery = (db.query(
+        AttendanceLog.user_id,
+        func.date(AttendanceLog.timestamp).label("log_date"),
+        func.min(AttendanceLog.timestamp).label("first_timestamp")
+    ).filter(
+        AttendanceLog.user_id.in_(roster_map.keys()),
+        AttendanceLog.action == "enter"
+    )
+    )
+    if start_date:
+        first_log_subquery = first_log_subquery.filter(func.date(AttendanceLog.timestamp) >= start_date)
+    if end_date:
+        first_log_subquery = first_log_subquery.filter(func.date(AttendanceLog.timestamp) <= end_date)
+    first_log_subquery = first_log_subquery.group_by(AttendanceLog.user_id,
+                                                     func.date(AttendanceLog.timestamp)).subquery()
+
+    # 2.2 Join กลับไปที่ตารางเต็ม เพื่อเอา log_status
+    all_first_logs = (db.query(
+        first_log_subquery.c.user_id,
+        first_log_subquery.c.log_date,
+        AttendanceLog.log_status  # ( ⭐️ ดึง log_status)
+    ).join(
+        AttendanceLog,
+        (AttendanceLog.user_id == first_log_subquery.c.user_id) &
+        (AttendanceLog.timestamp == first_log_subquery.c.first_timestamp)
+    )
+                      .all()
+                      )
+
+    # (Step 3: ประมวลผล Log)
     session_dates = sorted(list(set(log.log_date for log in all_first_logs)))
     kpi_sessions_taught = len(session_dates)
     if kpi_sessions_taught == 0:
@@ -963,45 +882,85 @@ def get_semester_overview(subjectId: str, db: Session = Depends(get_db)):
             kpis=ISemesterKPIs(totalRoster=kpi_total_roster, avgAttendance=0, avgLateness=0, sessionsTaught=0),
             trendGraph=ITrendGraph(labels=[], datasets=[]), studentsAtRisk=[])
 
-    student_lates = defaultdict(int);
-    student_absences = defaultdict(int);
+    student_lates_count = defaultdict(int)
+    student_absences_count = defaultdict(int)
     logs_by_date = defaultdict(list)
-    for user_id in roster_map.keys(): student_absences[user_id] = kpi_sessions_taught
-    total_attendances = 0;
+    for user_id in roster_map.keys(): student_absences_count[user_id] = kpi_sessions_taught
+    total_attendances = 0
     total_lates = 0
-    for log in all_first_logs:
-        check_in_datetime = log.first_timestamp;
-        class_start_datetime_on_log_date = datetime.combine(log.log_date, CLASS_START_TIME)
-        logs_by_date[log.log_date].append(log.user_id);
-        student_absences[log.user_id] -= 1;
-        total_attendances += 1
-        if check_in_datetime > class_start_datetime_on_log_date: student_lates[log.user_id] += 1; total_lates += 1
 
+    for log in all_first_logs:
+        logs_by_date[log.log_date].append(log)
+        student_absences_count[log.user_id] -= 1
+        total_attendances += 1
+
+        # ( ⭐️⭐️⭐️ นี่คือการเปลี่ยนแปลงที่สำคัญ ⭐️⭐️⭐️ )
+        if log.log_status == "Late":
+            student_lates_count[log.user_id] += 1
+            total_lates += 1
+
+    # (Step 4: คำนวณ KPIs - เหมือนเดิม)
     total_possible_attendances = kpi_total_roster * kpi_sessions_taught
     kpi_avg_attendance = (total_attendances / total_possible_attendances) * 100 if total_possible_attendances > 0 else 0
-    kpi_avg_lateness = (total_lates / total_possible_attendances) * 100 if total_possible_attendances > 0 else 0
+    kpi_avg_lateness = (total_lates / total_attendances) * 100 if total_attendances > 0 else 0
     kpis = ISemesterKPIs(totalRoster=kpi_total_roster, avgAttendance=round(kpi_avg_attendance, 1),
                          avgLateness=round(kpi_avg_lateness, 1), sessionsTaught=kpi_sessions_taught)
 
-    trend_dates_to_show = session_dates[-10:];
-    trend_labels = [d.strftime('%d/%m') for d in trend_dates_to_show];
-    trend_data = []
-    for d in trend_dates_to_show:
-        attendance_on_date = len(logs_by_date[d]);
-        rate = (attendance_on_date / kpi_total_roster) * 100
-        trend_data.append(round(rate, 1))
-    trend_graph = ITrendGraph(labels=trend_labels, datasets=[
-        ITrendDataset(label="% การเข้าเรียน", data=trend_data, borderColor='rgb(34, 197, 94)', fill=False)])
+    # (Step 5: คำนวณ Trend Graph - แก้ไข)
+    trend_dates_to_show = session_dates
+    trend_labels = [d.strftime('%d/%m') for d in trend_dates_to_show]
+    trend_data_present = [];
+    trend_data_late = [];
+    trend_data_absent = []
 
+    for d in trend_dates_to_show:
+        logs_on_date = logs_by_date[d]
+        present_on_time_count = 0
+        late_count = 0
+
+        for log in logs_on_date:
+            # ( ⭐️⭐️⭐️ นี่คือการเปลี่ยนแปลงที่สำคัญ ⭐️⭐️⭐️ )
+            if log.log_status == "Late":
+                late_count += 1
+            elif log.log_status == "Present":
+                present_on_time_count += 1
+
+        attended_count = len(logs_on_date)
+        absent_count = kpi_total_roster - attended_count
+
+        present_percent = (present_on_time_count / kpi_total_roster) * 100
+        late_percent = (late_count / kpi_total_roster) * 100
+        absent_percent = (absent_count / kpi_total_roster) * 100
+
+        trend_data_present.append(round(present_percent, 1))
+        trend_data_late.append(round(late_percent, 1))
+        trend_data_absent.append(round(absent_percent, 1))
+
+    # (กราฟเส้น 3 เส้น - เหมือนเดิม)
+    trend_graph = ITrendGraph(labels=trend_labels, datasets=[
+        ITrendDataset(label="เข้าเรียน (%)", data=trend_data_present, borderColor='rgba(34, 197, 94, 1)',
+                      backgroundColor='rgba(34, 197, 94, 0.1)', fill=True),
+        ITrendDataset(label="สาย (%)", data=trend_data_late, borderColor='rgba(245, 158, 11, 1)',
+                      backgroundColor='rgba(245, 158, 11, 0.1)', fill=True),
+        ITrendDataset(label="ขาด (%)", data=trend_data_absent, borderColor='rgba(239, 68, 68, 1)',
+                      backgroundColor='rgba(239, 68, 68, 0.1)', fill=True),
+    ])
+
+    # (Step 6: ตาราง % - เหมือนเดิม)
     at_risk_list = []
     for user_id, user in roster_map.items():
-        absences = student_absences[user_id];
-        lates = student_lates[user_id]
-        if absences > 0 or lates > 0: at_risk_list.append(
-            IStudentAtRisk(studentId=user.student_code or str(user.user_id), name=user.name, absences=absences,
-                           lates=lates))
-    at_risk_list.sort(key=lambda x: (x.absences, x.lates), reverse=True)
-    students_at_risk = at_risk_list[:5]
+        absences = student_absences_count[user_id]
+        lates = student_lates_count[user_id]
+        absences_percent = (absences / kpi_sessions_taught) * 100 if kpi_sessions_taught > 0 else 0
+        lates_percent = (lates / kpi_sessions_taught) * 100 if kpi_sessions_taught > 0 else 0
+        if absences > 0 or lates > 0:
+            at_risk_list.append(IStudentAtRisk(studentId=user.student_code or str(user.user_id), name=user.name,
+                                               absences_percent=round(absences_percent, 1),
+                                               lates_percent=round(lates_percent, 1)))
+    at_risk_list.sort(key=lambda x: (x.absences_percent, x.lates_percent), reverse=True)
+    students_at_risk = at_risk_list
+
+    # (Step 7: ส่งข้อมูลกลับ - เหมือนเดิม)
     return ISemesterOverviewData(kpis=kpis, trendGraph=trend_graph, studentsAtRisk=students_at_risk)
 
 
@@ -1012,6 +971,7 @@ def add_minutes_to_time(t: dt_time, minutes_to_add: int) -> dt_time:
     return new_dt.time()
 
 
+# --- [ ⭐️⭐️⭐️ 5. แก้ไขฟังก์ชันนี้ (ส่วนอ่าน Dashboard) ⭐️⭐️⭐️ ] ---
 @app.get("/api/faculty/session-view", response_model=ISessionViewData)
 def get_session_view(subjectId: str, date: date, db: Session = Depends(get_db)):
     try:
@@ -1023,48 +983,60 @@ def get_session_view(subjectId: str, date: date, db: Session = Depends(get_db)):
     if not subject:
         raise HTTPException(status_code=404, detail="Subject not found.")
     CLASS_START_TIME = subject.class_start_time or dt_time(9, 0, 0)
-    CLASS_START_DATETIME = datetime.combine(date, CLASS_START_TIME)
+    # (CLASS_START_DATETIME ไม่ได้ใช้แล้ว)
 
     roster_list = db.query(User).filter(User.subject_id == subject_id_int, User.is_deleted == 0).all()
     kpi_total = len(roster_list);
     roster_map = {u.user_id: u for u in roster_list}
-    if kpi_total == 0:
-        print(f"Warning: No students enrolled in subject {subject_id_int}.")
-        empty_kpis = ISessionKPIs(present=0, total=0, absent=0, late=0)
-        empty_donut = ISummaryDonut(labels=["เข้าเรียน (0)", "มาสาย (0)", "ขาด (0)"], datasets=[
-            ISummaryDonutDataset(data=[0, 0, 0], backgroundColor=['#22c55e', '#f59e0b', '#ef4444'])])
+
+    def get_empty_histogram():
         empty_hist_labels = [f"{add_minutes_to_time(CLASS_START_TIME, (i - 2) * 5).strftime('%H:%M')}" for i in
                              range(7)]
         empty_hist_labels[2] = f"{CLASS_START_TIME.strftime('%H:%M')} (เริ่ม)"
-        empty_hist = IArrivalHistogram(labels=empty_hist_labels, datasets=[
-            IArrivalHistogramDataset(label="จำนวนนักเรียน", data=[0] * 7, backgroundColor='#6366f1')])
-        return ISessionViewData(kpis=empty_kpis, summaryDonut=empty_donut, arrivalHistogram=empty_hist,
+        empty_hist_labels.insert(0, f"< {empty_hist_labels[0]}")
+        return IArrivalHistogram(labels=empty_hist_labels, datasets=[
+            IArrivalHistogramDataset(label="ร้อยละของนักเรียน", data=[0.0] * 8, backgroundColor='#6366f1')])
+
+    if kpi_total == 0:
+        print(f"Warning: No students enrolled in subject {subject_id_int}.")
+        empty_kpis = ISessionKPIs(present=0, total=0, absent=0, late=0)
+        empty_donut = ISummaryDonut(labels=["เข้าเรียน (0 คน, 0%)", "มาสาย (0 คน, 0%)", "ขาด (0 คน, 0%)"], datasets=[
+            ISummaryDonutDataset(data=[0, 0, 0], backgroundColor=['#22c55e', '#f59e0b', '#ef4444'])])
+        return ISessionViewData(kpis=empty_kpis, summaryDonut=empty_donut, arrivalHistogram=get_empty_histogram(),
                                 liveDataTable=[])
 
     start_of_day = datetime.combine(date, dt_time.min);
     end_of_day = datetime.combine(date, dt_time.max)
+
+    # ( ⭐️ ดึง Log แรกสุด พร้อม Status ที่บันทึกไว้ ⭐️ )
     first_log_subquery = (
         db.query(AttendanceLog.user_id, func.min(AttendanceLog.timestamp).label("first_timestamp")).filter(
             AttendanceLog.user_id.in_(roster_map.keys()), AttendanceLog.action == "enter",
             AttendanceLog.timestamp.between(start_of_day, end_of_day)).group_by(AttendanceLog.user_id).subquery())
-    first_logs_today = (db.query(AttendanceLog).join(first_log_subquery,
-                                                     (AttendanceLog.user_id == first_log_subquery.c.user_id) & (
-                                                             AttendanceLog.timestamp == first_log_subquery.c.first_timestamp)).all())
+    first_logs_today = (db.query(
+        AttendanceLog.user_id,
+        AttendanceLog.timestamp,
+        AttendanceLog.log_status  # ( ⭐️ ดึง Status มาด้วย )
+    ).join(first_log_subquery,
+           (AttendanceLog.user_id == first_log_subquery.c.user_id) & (
+                   AttendanceLog.timestamp == first_log_subquery.c.first_timestamp)).all())
     logs_map = {log.user_id: log for log in first_logs_today}
 
     live_data_table: List[ILiveDataEntry] = [];
     kpi_present_on_time = 0;
     kpi_late = 0;
     kpi_absent = 0
+
     for user_id, user in roster_map.items():
         log = logs_map.get(user_id)
         if log:
-            status = "Present";
-            if log.timestamp > CLASS_START_DATETIME:
-                status = "Late";
+            # ( ⭐️⭐️⭐️ นี่คือการเปลี่ยนแปลงที่สำคัญ ⭐️⭐️⭐️ )
+            status = log.log_status or "Present"  # (Fallback)
+            if status == "Late":
                 kpi_late += 1
             else:
                 kpi_present_on_time += 1
+
             live_data_table.append(
                 ILiveDataEntry(studentId=user.student_code or str(user.user_id), name=user.name, status=status,
                                checkIn=log.timestamp.isoformat(), checkOut=None, duration=None))
@@ -1074,13 +1046,24 @@ def get_session_view(subjectId: str, date: date, db: Session = Depends(get_db)):
                 ILiveDataEntry(studentId=user.student_code or str(user.user_id), name=user.name, status="Absent",
                                checkIn=None, checkOut=None, duration=None))
 
-    kpis = ISessionKPIs(present=(kpi_present_on_time + kpi_late), total=kpi_total, absent=kpi_absent, late=kpi_late)
+    kpi_present_total = kpi_present_on_time + kpi_late
+    kpis = ISessionKPIs(present=kpi_present_total, total=kpi_total, absent=kpi_absent, late=kpi_late)
+
+    # (Donut - เหมือนเดิม)
+    kpi_total_for_donut = kpi_total if kpi_total > 0 else 1
+    p_present = (kpi_present_on_time / kpi_total_for_donut) * 100
+    p_late = (kpi_late / kpi_total_for_donut) * 100
+    p_absent = (kpi_absent / kpi_total_for_donut) * 100
+    label_present = f"เข้าเรียน ({kpi_present_on_time} คน, {p_present:.0f}%)"
+    label_late = f"มาสาย ({kpi_late} คน, {p_late:.0f}%)"
+    label_absent = f"ขาด ({kpi_absent} คน, {p_absent:.0f}%)"
     summary_donut = ISummaryDonut(
-        labels=[f"เข้าเรียน ({kpi_present_on_time})", f"มาสาย ({kpi_late})", f"ขาด ({kpi_absent})"], datasets=[
+        labels=[label_present, label_late, label_absent], datasets=[
             ISummaryDonutDataset(data=[kpi_present_on_time, kpi_late, kpi_absent],
                                  backgroundColor=['rgba(34, 197, 94, 0.7)', 'rgba(245, 158, 11, 0.7)',
                                                   'rgba(239, 68, 68, 0.7)'])])
 
+    # (Histogram - เหมือนเดิม)
     all_enter_logs_today = db.query(AttendanceLog.timestamp).filter(AttendanceLog.user_id.in_(roster_map.keys()),
                                                                     AttendanceLog.action == "enter",
                                                                     AttendanceLog.timestamp.between(start_of_day,
@@ -1091,26 +1074,50 @@ def get_session_view(subjectId: str, date: date, db: Session = Depends(get_db)):
     num_buckets_before = 2;
     num_buckets_after = 4;
     total_buckets = num_buckets_before + 1 + num_buckets_after
+
+    # (สร้าง 7 ถังหลัก)
+    hist_labels_main = []
+    hist_buckets_start_main = []
     for i in range(-num_buckets_before, num_buckets_after + 1):
         minutes = i * interval_minutes;
         bucket_time = add_minutes_to_time(CLASS_START_TIME, minutes)
-        hist_buckets_start.append(bucket_time)
+        hist_buckets_start_main.append(bucket_time)
         if i == 0:
-            hist_labels.append(f"{bucket_time.strftime('%H:%M')} (เริ่ม)")
+            hist_labels_main.append(f"{bucket_time.strftime('%H:%M')} (เริ่ม)")
         else:
-            hist_labels.append(bucket_time.strftime('%H:%M'))
+            hist_labels_main.append(bucket_time.strftime('%H:%M'))
+
     final_boundary = add_minutes_to_time(CLASS_START_TIME, (num_buckets_after + 1) * interval_minutes);
-    hist_buckets_start.append(final_boundary);
-    hist_data = [0] * total_buckets
+    hist_buckets_start_main.append(final_boundary);
+
+    # (เพิ่มถัง "Earlier")
+    hist_data_count = [0] * (total_buckets + 1)
+    hist_labels = [f"< {hist_labels_main[0]}"] + hist_labels_main
+
+    main_start_time = hist_buckets_start_main[0]
     for log_tuple in all_enter_logs_today:
         log_time = log_tuple[0].time()
-        for i in range(total_buckets):
-            if hist_buckets_start[i] <= log_time < hist_buckets_start[i + 1]: hist_data[i] += 1; break
+
+        if log_time < main_start_time:
+            hist_data_count[0] += 1
+        else:
+            for i in range(total_buckets):
+                if hist_buckets_start_main[i] <= log_time < hist_buckets_start_main[i + 1]:
+                    hist_data_count[i + 1] += 1;
+                    break
+
+    # (แปลงเป็น %)
+    total_logs_in_hist = sum(hist_data_count)
+    if total_logs_in_hist == 0: total_logs_in_hist = 1
+    hist_data_percent = [(count / total_logs_in_hist) * 100 for count in hist_data_count]
+
     arrival_histogram = IArrivalHistogram(labels=hist_labels, datasets=[
-        IArrivalHistogramDataset(label="จำนวนนักเรียน", data=hist_data, backgroundColor='rgba(99, 102, 241, 0.7)')])
+        IArrivalHistogramDataset(label="ร้อยละของนักเรียน", data=hist_data_percent,
+                                 backgroundColor='rgba(99, 102, 241, 0.7)')])
 
     return ISessionViewData(kpis=kpis, summaryDonut=summary_donut, arrivalHistogram=arrival_histogram,
                             liveDataTable=live_data_table)
+
 
 # --- 9. Uvicorn Runner ---
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 # app/db_models.py
 from __future__ import annotations
 
-from datetime import datetime, time as dt_time # 👈 [1. แก้ไข] เพิ่ม import time
+from datetime import datetime, time as dt_time
 from typing import Generator, List, Optional
 
 from sqlalchemy import (
@@ -14,7 +14,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     create_engine,
-    Time, # 👈 [2. แก้ไข] เพิ่ม import Time
+    Time,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -63,12 +63,8 @@ class Subject(Base):
     cover_image_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     is_deleted: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     academic_year: Mapped[Optional[str]] = mapped_column(String(20), default=None)
-
-    # --- [3. แก้ไข] เพิ่ม 2 บรรทัดนี้ ---
-    class_start_time: Mapped[Optional[dt_time]] = mapped_column(Time) # เช่น 09:00:00
-    class_end_time: Mapped[Optional[dt_time]] = mapped_column(Time)   # เช่น 12:00:00
-    # ---
-
+    class_start_time: Mapped[Optional[dt_time]] = mapped_column(Time)
+    class_end_time: Mapped[Optional[dt_time]] = mapped_column(Time)
     users: Mapped[List["User"]] = relationship(back_populates="subject")
     logs: Mapped[List["AttendanceLog"]] = relationship(back_populates="subject")
 
@@ -108,6 +104,12 @@ class AttendanceLog(Base):
     subject_id: Mapped[Optional[int]] = mapped_column(ForeignKey("subjects.subject_id", ondelete="SET NULL"),
                                                       index=True)
     action: Mapped[str] = mapped_column(Enum("enter", "exit", name="attendance_action"), nullable=False)
+
+    # --- [ ⭐️⭐️⭐️ 1. เพิ่ม 2 คอลัมน์นี้ ⭐️⭐️⭐️ ] ---
+    log_status: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # (เช่น "Present", "Late")
+    log_rule_start_time: Mapped[Optional[dt_time]] = mapped_column(Time, nullable=True)  # (เช่น 09:00:00)
+    # ---
+
     timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     confidence: Mapped[Optional[float]] = mapped_column(Float)
     snapshot_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
