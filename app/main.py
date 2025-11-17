@@ -22,6 +22,9 @@ from .db_models import get_db, UserFace, User, AttendanceLog, Subject, UserType
 from .camera_handler import CameraManager, discover_local_devices
 from .ai_engine import refresh_facebank_from_db, load_facebank
 
+# ✨ [เพิ่ม] 1. Import auth.py ที่เราสร้าง
+from . import auth
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -67,9 +70,30 @@ async def _startup():
     print(f"[facebank] loaded users={cnt}")
 
 
-# --- 4. Face Upload & Training Endpoints (เหมือนเดิม) ---
+# --- ✨ [ใหม่] 4. Internal Helper Function ---
+# (ย้าย Logic มาจาก /train/refresh เพื่อให้ฟังก์ชันอื่นเรียกใช้ได้)
+def _internal_train_refresh(db: Session):
+    """Helper function to run the training logic."""
+    print("Running internal train refresh...")
+    rows = (
+        db.query(UserFace.user_id, UserFace.file_path, User.name)
+        .join(User, User.user_id == UserFace.user_id).all()
+    )
+    users, total = refresh_facebank_from_db(rows)
+    cnt = load_facebank()
+    print(f"Internal train refresh complete: {users} users, {total} images, {cnt} loaded.")
+    return {"message": "facebank updated", "users": users, "images_used": total, "loaded": cnt}
+
+
+# --- 5. Face Upload & Training Endpoints ---
 @app.post("/faces/upload")
-async def upload_faces(user_id: int = Form(...), images: list[UploadFile] = File(...), db: Session = Depends(get_db)):
+async def upload_faces(
+    user_id: int = Form(...),
+    images: list[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
     saved, items = 0, []
     user_dir = os.path.join(MEDIA_ROOT, str(user_id))
     os.makedirs(user_dir, exist_ok=True)
@@ -87,42 +111,56 @@ async def upload_faces(user_id: int = Form(...), images: list[UploadFile] = File
     return {"saved": saved, "items": items}
 
 
-# --- [ ⭐️⭐️⭐️ นี่คือฟังก์ชันที่แก้ไข ⭐️⭐️⭐️ ] ---
 @app.post("/train/refresh")
-def train_refresh(db: Session = Depends(get_db)):
-    rows = (
-        db.query(UserFace.user_id, UserFace.file_path, User.name)
-        # ( ⭐️ แก้ไขเงื่อนไข .join() ที่นี่ ⭐️ )
-        .join(User, User.user_id == UserFace.user_id).all()
-    )
-    users, total = refresh_facebank_from_db(rows)
-    cnt = load_facebank()
-    return {"message": "facebank updated", "users": users, "images_used": total, "loaded": cnt}
+def train_refresh(
+    db: Session = Depends(get_db),
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
+    # ✨ [แก้ไข] เรียกใช้ Helper แทน
+    return _internal_train_refresh(db)
 
 
-# --- 5. Camera Control & Stream Endpoints (เหมือนเดิม) ---
+# --- 6. Camera Control & Stream Endpoints ---
 @app.get("/cameras")
-def list_cameras(): return {"cams": cam_mgr.list()}
+def list_cameras(
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
+    return {"cams": cam_mgr.list()}
 
 
 @app.post("/cameras/{cam_id}/open")
-def open_camera(cam_id: str):
+def open_camera(
+    cam_id: str,
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
     cam_mgr.open(cam_id);
     return {"message": f"camera '{cam_id}' opened"}
 
 
 @app.post("/cameras/{cam_id}/close")
-def close_camera(cam_id: str):
+def close_camera(
+    cam_id: str,
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
     cam_mgr.close(cam_id);
     return {"message": f"camera '{cam_id}' closed"}
 
 
 @app.get("/cameras/{cam_id}/snapshot", responses={200: {"content": {"image/jpeg": {}}}})
-def camera_snapshot(cam_id: str):
+def camera_snapshot(
+    cam_id: str,
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
     jpg = cam_mgr.get_jpeg(cam_id);
     return Response(content=jpg, media_type="image/jpeg")
 
 
+# --- (เว้นไว้: mjpeg, ws_camera, ws_ai_results ไม่ต้องป้องกัน) ---
 @app.get("/cameras/{cam_id}/mjpeg")
 def camera_mjpeg(cam_id: str):
     boundary = "frame"
@@ -208,10 +246,16 @@ async def ws_ai_results(ws: WebSocket, cam_id: str):
         print(f"[WS AI {cam_id}] Error: {e}")
     finally:
         print(f"[WS AI {cam_id}] Connection closed.")
+# --- (สิ้นสุดส่วนที่ไม่ต้องป้องกัน) ---
 
 
 @app.get("/cameras/discover")
-async def cameras_discover(max_index: int = 10, test_frame: bool = True):
+async def cameras_discover(
+    max_index: int = 10,
+    test_frame: bool = True,
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
     print("Discovering local devices...")
     active_sources = [c.src for c in cam_mgr.sources.values() if c.is_open]
     print(f"Active sources (will skip test): {active_sources}")
@@ -221,23 +265,35 @@ async def cameras_discover(max_index: int = 10, test_frame: bool = True):
 
 
 @app.get("/cameras/config")
-def get_camera_config(): return {"mapping": {k: v.src for k, v in cam_mgr.sources.items()}}
+def get_camera_config(
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
+    return {"mapping": {k: v.src for k, v in cam_mgr.sources.items()}}
 
 
 @app.post("/cameras/config")
-def set_camera_config(mapping: dict = Body(..., example={"entrance": "0", "exit": "1"})):
+def set_camera_config(
+    mapping: dict = Body(..., example={"entrance": "0", "exit": "1"}),
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
     print(f"Reconfiguring cameras to: {mapping}")
     cam_mgr.reconfigure(mapping)
     return {"message": "camera mapping updated", "mapping": mapping}
 
 
-# --- 6. Attendance API Endpoints ---
+# --- 7. Attendance API Endpoints ---
 class ActiveSubjectPayload(BaseModel):
     subject_id: Optional[int] = None
 
-
 @app.post("/attendance/set_active_subject")
-def set_active_subject(payload: ActiveSubjectPayload, db: Session = Depends(get_db)):
+def set_active_subject(
+    payload: ActiveSubjectPayload,
+    db: Session = Depends(get_db),
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
     active_user_ids: Optional[set] = None
     roster_size = 0
     if payload.subject_id is not None:
@@ -256,21 +312,31 @@ def set_active_subject(payload: ActiveSubjectPayload, db: Session = Depends(get_
 
 
 @app.post("/attendance/start")
-def start_attendance():
+def start_attendance(
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
     print("Starting AI processing for all cameras...")
     for cam in cam_mgr.sources.values(): cam.is_ai_paused = False
     return {"message": "Attendance started"}
 
 
 @app.post("/attendance/stop")
-def stop_attendance():
+def stop_attendance(
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
     print("Stopping AI processing for all cameras...")
     for cam in cam_mgr.sources.values(): cam.is_ai_paused = True
     return {"message": "Attendance stopped"}
 
 
 @app.get("/attendance/poll", response_model=List[dict])
-async def get_attendance_events(db: Session = Depends(get_db)):
+async def get_attendance_events(
+    db: Session = Depends(get_db),
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
     events = cam_mgr.get_attendance_events()
     if not events: return []
     today = date.today()
@@ -371,8 +437,12 @@ async def get_attendance_events(db: Session = Depends(get_db)):
 
 @app.get("/attendance/logs", response_model=List[dict])
 async def get_attendance_logs(
-        start_date: Optional[date] = None, end_date: Optional[date] = None,
-        subject_id: Optional[int] = None, db: Session = Depends(get_db)
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    subject_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     query = (
         db.query(
@@ -405,11 +475,13 @@ async def get_attendance_logs(
 
 @app.get("/attendance/export")
 async def export_attendance_logs(
-        start_date: Optional[date] = None,
-        end_date: Optional[date] = None,
-        subject_id: Optional[int] = None,
-        format: str = "csv",
-        db: Session = Depends(get_db)
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    subject_id: Optional[int] = None,
+    format: str = "csv",
+    db: Session = Depends(get_db),
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     query = (
         db.query(
@@ -506,16 +578,24 @@ async def export_attendance_logs(
 
 
 @app.post("/attendance/clear/{cam_id}")
-async def clear_attendance_log(cam_id: str):
+async def clear_attendance_log(
+    cam_id: str,
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
     if cam_mgr.clear_attendance_session(cam_id):
         return {"message": f"Attendance session for {cam_id} cleared."}
     else:
         raise HTTPException(status_code=404, detail=f"Camera {cam_id} not found or not open.")
 
 
-# --- 7. User Management & Subject Endpoints (เหมือนเดิม) ---
+# --- 8. User Management & Subject Endpoints ---
 @app.get("/subjects", response_model=List[dict])
-def list_subjects(db: Session = Depends(get_db)):
+def list_subjects(
+    db: Session = Depends(get_db),
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
     subjects = db.query(Subject).filter(Subject.is_deleted == 0).all()
     return [
         {"subject_id": s.subject_id, "subject_name": s.subject_name, "section": s.section,
@@ -539,8 +619,10 @@ class SubjectCreate(BaseModel):
 
 @app.post("/subjects", response_model=dict)
 async def create_subject(
-        payload: SubjectCreate,
-        db: Session = Depends(get_db)
+    payload: SubjectCreate,
+    db: Session = Depends(get_db),
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     existing_subject = db.query(Subject).filter(
         Subject.subject_name == payload.subject_name,
@@ -586,7 +668,12 @@ async def create_subject(
 
 
 @app.delete("/subjects/{subject_id}")
-def delete_subject(subject_id: int, db: Session = Depends(get_db)):
+def delete_subject(
+    subject_id: int,
+    db: Session = Depends(get_db),
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
     subject = db.query(Subject).filter(
         Subject.subject_id == subject_id,
         Subject.is_deleted == 0
@@ -599,7 +686,12 @@ def delete_subject(subject_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/subjects/{subject_id}/student_count", response_model=dict)
-def get_subject_student_count(subject_id: int, db: Session = Depends(get_db)):
+def get_subject_student_count(
+    subject_id: int,
+    db: Session = Depends(get_db),
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
     count = db.query(User).filter(
         User.subject_id == subject_id,
         User.is_deleted == 0
@@ -612,7 +704,13 @@ class SubjectTimeUpdate(BaseModel):
 
 
 @app.put("/api/subjects/{subject_id}/time", response_model=dict)
-def update_subject_time(subject_id: int, payload: SubjectTimeUpdate, db: Session = Depends(get_db)):
+def update_subject_time(
+    subject_id: int,
+    payload: SubjectTimeUpdate,
+    db: Session = Depends(get_db),
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
     subject = db.query(Subject).filter(Subject.subject_id == subject_id).first()
     if not subject:
         raise HTTPException(status_code=404, detail="Subject not found")
@@ -645,7 +743,12 @@ class UserUpdate(BaseModel):
 
 
 @app.post("/users")
-def create_user(payload: UserCreate, db: Session = Depends(get_db)):
+def create_user(
+    payload: UserCreate,
+    db: Session = Depends(get_db),
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
     if payload.role not in ["admin", "operator", "viewer"]:
         raise HTTPException(status_code=400, detail="Invalid role")
     if payload.student_code:
@@ -669,8 +772,10 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db)):
 
 @app.get("/users", response_model=List[dict])
 def list_users(
-        subject_id: Optional[int] = None,
-        db: Session = Depends(get_db)
+    subject_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     query = db.query(User).options(selectinload(User.faces)).filter(User.is_deleted == 0)
     if subject_id is not None:
@@ -689,7 +794,13 @@ def list_users(
 
 
 @app.put("/users/{user_id}")
-def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db)):
+def update_user(
+    user_id: int,
+    payload: UserUpdate,
+    db: Session = Depends(get_db),
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
     user = db.query(User).filter(User.user_id == user_id, User.is_deleted == 0).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -713,7 +824,12 @@ def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db)
 
 
 @app.delete("/users/{user_id}")
-def delete_user(user_id: int, db: Session = Depends(get_db)):
+def delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
     user = db.query(User).options(selectinload(User.faces)).filter(User.user_id == user_id,
                                                                    User.is_deleted == 0).first()
     if not user: raise HTTPException(status_code=404, detail="User not found")
@@ -729,14 +845,20 @@ def delete_user(user_id: int, db: Session = Depends(get_db)):
         db.rollback();
         raise HTTPException(status_code=500, detail=f"Failed to delete user data: {e}")
     try:
-        train_refresh(db)
+        # ✨ [แก้ไข] เรียกใช้ Helper
+        _internal_train_refresh(db)
     except Exception as e:
-        print(f"Warning: train_refresh failed after deleting user: {e}")
+        print(f"Warning: _internal_train_refresh failed after deleting user: {e}")
     return {"message": f"User {user_id} ({user.name}) marked as deleted and all face data removed."}
 
 
 @app.delete("/faces/{face_id}")
-def delete_face(face_id: int, db: Session = Depends(get_db)):
+def delete_face(
+    face_id: int,
+    db: Session = Depends(get_db),
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
     face = db.query(UserFace).filter(UserFace.face_id == face_id).first()
     if not face:
         raise HTTPException(status_code=404, detail="Face image not found")
@@ -747,62 +869,56 @@ def delete_face(face_id: int, db: Session = Depends(get_db)):
         if os.path.exists(file_path):
             os.remove(file_path)
         try:
-            train_refresh(db)
+            # ✨ [แก้ไข] เรียกใช้ Helper
+            _internal_train_refresh(db)
         except Exception as e:
-            print(f"Warning: train_refresh failed after deleting face: {e}")
+            print(f"Warning: _internal_train_refresh failed after deleting face: {e}")
         return {"message": f"Face image {face_id} ({face.file_path}) deleted."}
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to delete face: {e}")
 
 
-# --- 8. Faculty Dashboard Endpoints ---
+# --- 9. Faculty Dashboard Endpoints ---
 class ISubjectResponse(BaseModel): id: str; name: str
-
-
 class ISemesterKPIs(BaseModel): totalRoster: int; avgAttendance: float; avgLateness: float; sessionsTaught: int
-
-
 class ITrendDataset(BaseModel): label: str; data: List[float]; borderColor: Optional[str] = None; fill: Optional[
     bool] = False; backgroundColor: Optional[str] = None
-
-
 class ITrendGraph(BaseModel): labels: List[str]; datasets: List[ITrendDataset]
-
-
-class IStudentAtRisk(BaseModel): studentId: str; name: str; absences_percent: float; lates_percent: float
-
-
-class ISemesterOverviewData(BaseModel): kpis: ISemesterKPIs; trendGraph: ITrendGraph; studentsAtRisk: List[
-    IStudentAtRisk]
-
-
+class IStudentLateRisk(BaseModel):
+    studentId: str
+    name: str
+    lates_percent: float
+    lates_count: int
+class IStudentAbsentRisk(BaseModel):
+    studentId: str
+    name: str
+    absences_percent: float
+    absences_count: int
+class ISemesterOverviewData(BaseModel):
+    kpis: ISemesterKPIs
+    trendGraph: ITrendGraph
+    studentsLate: List[IStudentLateRisk]
+    studentsAbsent: List[IStudentAbsentRisk]
 class ISessionKPIs(BaseModel): present: int; total: int; absent: int; late: int
-
-
 class ISummaryDonutDataset(BaseModel): data: List[int]; backgroundColor: List[str]
-
-
 class ISummaryDonut(BaseModel): labels: List[str]; datasets: List[ISummaryDonutDataset]
-
-
 class IArrivalHistogramDataset(BaseModel): label: str; data: List[float]; backgroundColor: str
-
-
 class IArrivalHistogram(BaseModel): labels: List[str]; datasets: List[IArrivalHistogramDataset]
-
-
 class ILiveDataEntry(BaseModel): studentId: str; name: str; status: str; checkIn: Optional[str] = None; checkOut: \
-Optional[str] = None; duration: Optional[str] = None
-
-
+    Optional[str] = None; duration: Optional[str] = None
 class ISessionViewData(
     BaseModel): kpis: ISessionKPIs; summaryDonut: ISummaryDonut; arrivalHistogram: IArrivalHistogram; liveDataTable: \
-List[ILiveDataEntry]
+    List[ILiveDataEntry]
 
 
 @app.get("/api/faculty/subjects", response_model=List[ISubjectResponse])
-def get_faculty_subjects(db: Session = Depends(get_db)):
+def get_faculty_subjects(
+    db: Session = Depends(get_db),
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
+    print(f"User '{user_claims.get('name')}' requesting subjects...") # (ตัวอย่างการใช้ user_claims)
     try:
         subjects = db.query(Subject).filter(Subject.is_deleted == 0).order_by(Subject.academic_year.desc(),
                                                                               Subject.subject_name).all()
@@ -819,32 +935,31 @@ def get_faculty_subjects(db: Session = Depends(get_db)):
                             detail=f"Database query failed. Check if DB schema is up to date. Error: {e}")
 
 
-# --- [ ⭐️⭐️⭐️ 4. แก้ไขฟังก์ชันนี้ (ส่วนอ่าน Dashboard) ⭐️⭐️⭐️ ] ---
 @app.get("/api/faculty/semester-overview", response_model=ISemesterOverviewData)
 def get_semester_overview(
-        subjectId: str,
-        start_date: Optional[date] = None,
-        end_date: Optional[date] = None,
-        db: Session = Depends(get_db)
+    subjectId: str,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    db: Session = Depends(get_db),
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     try:
         subject_id_int = int(subjectId)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid subjectId format.")
 
-    # (Step 1: ดึง Roster - เหมือนเดิม)
     roster_list = db.query(User).filter(User.subject_id == subject_id_int, User.is_deleted == 0).all()
     kpi_total_roster = len(roster_list)
     roster_map = {u.user_id: u for u in roster_list}
     if kpi_total_roster == 0:
         return ISemesterOverviewData(
             kpis=ISemesterKPIs(totalRoster=0, avgAttendance=0, avgLateness=0, sessionsTaught=0),
-            trendGraph=ITrendGraph(labels=[], datasets=[]), studentsAtRisk=[])
+            trendGraph=ITrendGraph(labels=[], datasets=[]),
+            studentsLate=[],
+            studentsAbsent=[]
+        )
 
-    # (Step 2: ดึง Log ภายใน Date Range)
-    # ( ⭐️⭐️⭐️ Logic ใหม่: ดึง "Log แรกของวัน" พร้อม "Status ที่บันทึกไว้" ⭐️⭐️⭐️)
-
-    # 2.1 หา timestamp แรกสุดของแต่ละ (user, date)
     first_log_subquery = (db.query(
         AttendanceLog.user_id,
         func.date(AttendanceLog.timestamp).label("log_date"),
@@ -861,11 +976,10 @@ def get_semester_overview(
     first_log_subquery = first_log_subquery.group_by(AttendanceLog.user_id,
                                                      func.date(AttendanceLog.timestamp)).subquery()
 
-    # 2.2 Join กลับไปที่ตารางเต็ม เพื่อเอา log_status
     all_first_logs = (db.query(
         first_log_subquery.c.user_id,
         first_log_subquery.c.log_date,
-        AttendanceLog.log_status  # ( ⭐️ ดึง log_status)
+        AttendanceLog.log_status
     ).join(
         AttendanceLog,
         (AttendanceLog.user_id == first_log_subquery.c.user_id) &
@@ -874,13 +988,15 @@ def get_semester_overview(
                       .all()
                       )
 
-    # (Step 3: ประมวลผล Log)
     session_dates = sorted(list(set(log.log_date for log in all_first_logs)))
     kpi_sessions_taught = len(session_dates)
     if kpi_sessions_taught == 0:
         return ISemesterOverviewData(
             kpis=ISemesterKPIs(totalRoster=kpi_total_roster, avgAttendance=0, avgLateness=0, sessionsTaught=0),
-            trendGraph=ITrendGraph(labels=[], datasets=[]), studentsAtRisk=[])
+            trendGraph=ITrendGraph(labels=[], datasets=[]),
+            studentsLate=[],
+            studentsAbsent=[]
+        )
 
     student_lates_count = defaultdict(int)
     student_absences_count = defaultdict(int)
@@ -893,20 +1009,16 @@ def get_semester_overview(
         logs_by_date[log.log_date].append(log)
         student_absences_count[log.user_id] -= 1
         total_attendances += 1
-
-        # ( ⭐️⭐️⭐️ นี่คือการเปลี่ยนแปลงที่สำคัญ ⭐️⭐️⭐️ )
         if log.log_status == "Late":
             student_lates_count[log.user_id] += 1
             total_lates += 1
 
-    # (Step 4: คำนวณ KPIs - เหมือนเดิม)
     total_possible_attendances = kpi_total_roster * kpi_sessions_taught
     kpi_avg_attendance = (total_attendances / total_possible_attendances) * 100 if total_possible_attendances > 0 else 0
     kpi_avg_lateness = (total_lates / total_attendances) * 100 if total_attendances > 0 else 0
     kpis = ISemesterKPIs(totalRoster=kpi_total_roster, avgAttendance=round(kpi_avg_attendance, 1),
                          avgLateness=round(kpi_avg_lateness, 1), sessionsTaught=kpi_sessions_taught)
 
-    # (Step 5: คำนวณ Trend Graph - แก้ไข)
     trend_dates_to_show = session_dates
     trend_labels = [d.strftime('%d/%m') for d in trend_dates_to_show]
     trend_data_present = [];
@@ -919,7 +1031,6 @@ def get_semester_overview(
         late_count = 0
 
         for log in logs_on_date:
-            # ( ⭐️⭐️⭐️ นี่คือการเปลี่ยนแปลงที่สำคัญ ⭐️⭐️⭐️ )
             if log.log_status == "Late":
                 late_count += 1
             elif log.log_status == "Present":
@@ -936,7 +1047,6 @@ def get_semester_overview(
         trend_data_late.append(round(late_percent, 1))
         trend_data_absent.append(round(absent_percent, 1))
 
-    # (กราฟเส้น 3 เส้น - เหมือนเดิม)
     trend_graph = ITrendGraph(labels=trend_labels, datasets=[
         ITrendDataset(label="เข้าเรียน (%)", data=trend_data_present, borderColor='rgba(34, 197, 94, 1)',
                       backgroundColor='rgba(34, 197, 94, 0.1)', fill=True),
@@ -946,22 +1056,44 @@ def get_semester_overview(
                       backgroundColor='rgba(239, 68, 68, 0.1)', fill=True),
     ])
 
-    # (Step 6: ตาราง % - เหมือนเดิม)
-    at_risk_list = []
+    students_late_list: List[IStudentLateRisk] = []
+    students_absent_list: List[IStudentAbsentRisk] = []
+
     for user_id, user in roster_map.items():
         absences = student_absences_count[user_id]
         lates = student_lates_count[user_id]
-        absences_percent = (absences / kpi_sessions_taught) * 100 if kpi_sessions_taught > 0 else 0
-        lates_percent = (lates / kpi_sessions_taught) * 100 if kpi_sessions_taught > 0 else 0
-        if absences > 0 or lates > 0:
-            at_risk_list.append(IStudentAtRisk(studentId=user.student_code or str(user.user_id), name=user.name,
-                                               absences_percent=round(absences_percent, 1),
-                                               lates_percent=round(lates_percent, 1)))
-    at_risk_list.sort(key=lambda x: (x.absences_percent, x.lates_percent), reverse=True)
-    students_at_risk = at_risk_list
 
-    # (Step 7: ส่งข้อมูลกลับ - เหมือนเดิม)
-    return ISemesterOverviewData(kpis=kpis, trendGraph=trend_graph, studentsAtRisk=students_at_risk)
+        if absences > 0:
+            absences_percent = (absences / kpi_sessions_taught) * 100 if kpi_sessions_taught > 0 else 0
+            students_absent_list.append(
+                IStudentAbsentRisk(
+                    studentId=user.student_code or str(user.user_id),
+                    name=user.name,
+                    absences_percent=round(absences_percent, 1),
+                    absences_count=absences
+                )
+            )
+
+        if lates > 0:
+            lates_percent = (lates / kpi_sessions_taught) * 100 if kpi_sessions_taught > 0 else 0
+            students_late_list.append(
+                IStudentLateRisk(
+                    studentId=user.student_code or str(user.user_id),
+                    name=user.name,
+                    lates_percent=round(lates_percent, 1),
+                    lates_count=lates
+                )
+            )
+
+    students_absent_list.sort(key=lambda x: x.absences_percent, reverse=True)
+    students_late_list.sort(key=lambda x: x.lates_percent, reverse=True)
+
+    return ISemesterOverviewData(
+        kpis=kpis,
+        trendGraph=trend_graph,
+        studentsLate=students_late_list,
+        studentsAbsent=students_absent_list
+    )
 
 
 def add_minutes_to_time(t: dt_time, minutes_to_add: int) -> dt_time:
@@ -971,9 +1103,14 @@ def add_minutes_to_time(t: dt_time, minutes_to_add: int) -> dt_time:
     return new_dt.time()
 
 
-# --- [ ⭐️⭐️⭐️ 5. แก้ไขฟังก์ชันนี้ (ส่วนอ่าน Dashboard) ⭐️⭐️⭐️ ] ---
 @app.get("/api/faculty/session-view", response_model=ISessionViewData)
-def get_session_view(subjectId: str, date: date, db: Session = Depends(get_db)):
+def get_session_view(
+    subjectId: str,
+    date: date,
+    db: Session = Depends(get_db),
+    # ✨ [ป้องกัน]
+    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
     try:
         subject_id_int = int(subjectId)
     except ValueError:
@@ -983,7 +1120,6 @@ def get_session_view(subjectId: str, date: date, db: Session = Depends(get_db)):
     if not subject:
         raise HTTPException(status_code=404, detail="Subject not found.")
     CLASS_START_TIME = subject.class_start_time or dt_time(9, 0, 0)
-    # (CLASS_START_DATETIME ไม่ได้ใช้แล้ว)
 
     roster_list = db.query(User).filter(User.subject_id == subject_id_int, User.is_deleted == 0).all()
     kpi_total = len(roster_list);
@@ -995,7 +1131,7 @@ def get_session_view(subjectId: str, date: date, db: Session = Depends(get_db)):
         empty_hist_labels[2] = f"{CLASS_START_TIME.strftime('%H:%M')} (เริ่ม)"
         empty_hist_labels.insert(0, f"< {empty_hist_labels[0]}")
         return IArrivalHistogram(labels=empty_hist_labels, datasets=[
-            IArrivalHistogramDataset(label="ร้อยละของนักเรียน", data=[0.0] * 8, backgroundColor='#6366f1')])
+            IArrivalHistogramDataset(label="จำนวนนักเรียน", data=[0] * 8, backgroundColor='#6366f1')])
 
     if kpi_total == 0:
         print(f"Warning: No students enrolled in subject {subject_id_int}.")
@@ -1008,7 +1144,6 @@ def get_session_view(subjectId: str, date: date, db: Session = Depends(get_db)):
     start_of_day = datetime.combine(date, dt_time.min);
     end_of_day = datetime.combine(date, dt_time.max)
 
-    # ( ⭐️ ดึง Log แรกสุด พร้อม Status ที่บันทึกไว้ ⭐️ )
     first_log_subquery = (
         db.query(AttendanceLog.user_id, func.min(AttendanceLog.timestamp).label("first_timestamp")).filter(
             AttendanceLog.user_id.in_(roster_map.keys()), AttendanceLog.action == "enter",
@@ -1016,7 +1151,7 @@ def get_session_view(subjectId: str, date: date, db: Session = Depends(get_db)):
     first_logs_today = (db.query(
         AttendanceLog.user_id,
         AttendanceLog.timestamp,
-        AttendanceLog.log_status  # ( ⭐️ ดึง Status มาด้วย )
+        AttendanceLog.log_status
     ).join(first_log_subquery,
            (AttendanceLog.user_id == first_log_subquery.c.user_id) & (
                    AttendanceLog.timestamp == first_log_subquery.c.first_timestamp)).all())
@@ -1030,8 +1165,7 @@ def get_session_view(subjectId: str, date: date, db: Session = Depends(get_db)):
     for user_id, user in roster_map.items():
         log = logs_map.get(user_id)
         if log:
-            # ( ⭐️⭐️⭐️ นี่คือการเปลี่ยนแปลงที่สำคัญ ⭐️⭐️⭐️ )
-            status = log.log_status or "Present"  # (Fallback)
+            status = log.log_status or "Present"
             if status == "Late":
                 kpi_late += 1
             else:
@@ -1049,7 +1183,6 @@ def get_session_view(subjectId: str, date: date, db: Session = Depends(get_db)):
     kpi_present_total = kpi_present_on_time + kpi_late
     kpis = ISessionKPIs(present=kpi_present_total, total=kpi_total, absent=kpi_absent, late=kpi_late)
 
-    # (Donut - เหมือนเดิม)
     kpi_total_for_donut = kpi_total if kpi_total > 0 else 1
     p_present = (kpi_present_on_time / kpi_total_for_donut) * 100
     p_late = (kpi_late / kpi_total_for_donut) * 100
@@ -1063,7 +1196,6 @@ def get_session_view(subjectId: str, date: date, db: Session = Depends(get_db)):
                                  backgroundColor=['rgba(34, 197, 94, 0.7)', 'rgba(245, 158, 11, 0.7)',
                                                   'rgba(239, 68, 68, 0.7)'])])
 
-    # (Histogram - เหมือนเดิม)
     all_enter_logs_today = db.query(AttendanceLog.timestamp).filter(AttendanceLog.user_id.in_(roster_map.keys()),
                                                                     AttendanceLog.action == "enter",
                                                                     AttendanceLog.timestamp.between(start_of_day,
@@ -1075,7 +1207,6 @@ def get_session_view(subjectId: str, date: date, db: Session = Depends(get_db)):
     num_buckets_after = 4;
     total_buckets = num_buckets_before + 1 + num_buckets_after
 
-    # (สร้าง 7 ถังหลัก)
     hist_labels_main = []
     hist_buckets_start_main = []
     for i in range(-num_buckets_before, num_buckets_after + 1):
@@ -1083,14 +1214,13 @@ def get_session_view(subjectId: str, date: date, db: Session = Depends(get_db)):
         bucket_time = add_minutes_to_time(CLASS_START_TIME, minutes)
         hist_buckets_start_main.append(bucket_time)
         if i == 0:
-            hist_labels_main.append(f"{bucket_time.strftime('%H:%M')} (เริ่ม)")
+            hist_labels_main.append(f"{CLASS_START_TIME.strftime('%H:%M')} (เริ่ม)")
         else:
             hist_labels_main.append(bucket_time.strftime('%H:%M'))
 
     final_boundary = add_minutes_to_time(CLASS_START_TIME, (num_buckets_after + 1) * interval_minutes);
     hist_buckets_start_main.append(final_boundary);
 
-    # (เพิ่มถัง "Earlier")
     hist_data_count = [0] * (total_buckets + 1)
     hist_labels = [f"< {hist_labels_main[0]}"] + hist_labels_main
 
@@ -1106,20 +1236,17 @@ def get_session_view(subjectId: str, date: date, db: Session = Depends(get_db)):
                     hist_data_count[i + 1] += 1;
                     break
 
-    # (แปลงเป็น %)
-    total_logs_in_hist = sum(hist_data_count)
-    if total_logs_in_hist == 0: total_logs_in_hist = 1
-    hist_data_percent = [(count / total_logs_in_hist) * 100 for count in hist_data_count]
-
     arrival_histogram = IArrivalHistogram(labels=hist_labels, datasets=[
-        IArrivalHistogramDataset(label="ร้อยละของนักเรียน", data=hist_data_percent,
-                                 backgroundColor='rgba(99, 102, 241, 0.7)')])
+        IArrivalHistogramDataset(
+            label="จำนวนนักเรียน",
+            data=hist_data_count,
+            backgroundColor='rgba(99, 102, 241, 0.7)')])
 
     return ISessionViewData(kpis=kpis, summaryDonut=summary_donut, arrivalHistogram=arrival_histogram,
                             liveDataTable=live_data_table)
 
 
-# --- 9. Uvicorn Runner ---
+# --- 10. Uvicorn Runner ---
 if __name__ == "__main__":
     import uvicorn
 
