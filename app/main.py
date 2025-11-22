@@ -22,7 +22,6 @@ from .db_models import get_db, UserFace, User, AttendanceLog, Subject, UserType
 from .camera_handler import CameraManager, discover_local_devices
 from .ai_engine import refresh_facebank_from_db, load_facebank
 
-# ✨ [เพิ่ม] 1. Import auth.py ที่เราสร้าง
 from . import auth
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -70,8 +69,7 @@ async def _startup():
     print(f"[facebank] loaded users={cnt}")
 
 
-# --- ✨ [ใหม่] 4. Internal Helper Function ---
-# (ย้าย Logic มาจาก /train/refresh เพื่อให้ฟังก์ชันอื่นเรียกใช้ได้)
+# --- 4. Internal Helper Function ---
 def _internal_train_refresh(db: Session):
     """Helper function to run the training logic."""
     print("Running internal train refresh...")
@@ -88,11 +86,10 @@ def _internal_train_refresh(db: Session):
 # --- 5. Face Upload & Training Endpoints ---
 @app.post("/faces/upload")
 async def upload_faces(
-    user_id: int = Form(...),
-    images: list[UploadFile] = File(...),
-    db: Session = Depends(get_db),
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        user_id: int = Form(...),
+        images: list[UploadFile] = File(...),
+        db: Session = Depends(get_db),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     saved, items = 0, []
     user_dir = os.path.join(MEDIA_ROOT, str(user_id))
@@ -113,19 +110,16 @@ async def upload_faces(
 
 @app.post("/train/refresh")
 def train_refresh(
-    db: Session = Depends(get_db),
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        db: Session = Depends(get_db),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
-    # ✨ [แก้ไข] เรียกใช้ Helper แทน
     return _internal_train_refresh(db)
 
 
 # --- 6. Camera Control & Stream Endpoints ---
 @app.get("/cameras")
 def list_cameras(
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     return {"cams": cam_mgr.list()}
 
@@ -133,7 +127,6 @@ def list_cameras(
 @app.post("/cameras/{cam_id}/open")
 def open_camera(
     cam_id: str,
-    # ✨ [ป้องกัน]
     user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     cam_mgr.open(cam_id);
@@ -143,7 +136,6 @@ def open_camera(
 @app.post("/cameras/{cam_id}/close")
 def close_camera(
     cam_id: str,
-    # ✨ [ป้องกัน]
     user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     cam_mgr.close(cam_id);
@@ -152,12 +144,30 @@ def close_camera(
 
 @app.get("/cameras/{cam_id}/snapshot", responses={200: {"content": {"image/jpeg": {}}}})
 def camera_snapshot(
-    cam_id: str,
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        cam_id: str,
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     jpg = cam_mgr.get_jpeg(cam_id);
     return Response(content=jpg, media_type="image/jpeg")
+
+
+# --- ✨ [ใหม่] 7.1. Endpoint สำหรับถ่ายภาพจากกล้องที่เปิดอยู่ ---
+@app.get("/cameras/capture_latest_frame", responses={200: {"content": {"image/jpeg": {}}}})
+def capture_latest_frame(
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
+    """
+    ดึงเฟรมล่าสุดจากกล้องตัวใดก็ได้ที่ CameraManager กำลังสตรีมอยู่
+    """
+    frame_jpg = cam_mgr.get_latest_frame_jpg()
+
+    if not frame_jpg:
+        raise HTTPException(
+            status_code=404,
+            detail="No active camera found or failed to capture a frame. Please ensure a camera is running (e.g., on the Access Control page)."
+        )
+
+    return Response(content=frame_jpg, media_type="image/jpeg")
 
 
 # --- (เว้นไว้: mjpeg, ws_camera, ws_ai_results ไม่ต้องป้องกัน) ---
@@ -246,15 +256,16 @@ async def ws_ai_results(ws: WebSocket, cam_id: str):
         print(f"[WS AI {cam_id}] Error: {e}")
     finally:
         print(f"[WS AI {cam_id}] Connection closed.")
+
+
 # --- (สิ้นสุดส่วนที่ไม่ต้องป้องกัน) ---
 
 
 @app.get("/cameras/discover")
 async def cameras_discover(
-    max_index: int = 10,
-    test_frame: bool = True,
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        max_index: int = 10,
+        test_frame: bool = True,
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     print("Discovering local devices...")
     active_sources = [c.src for c in cam_mgr.sources.values() if c.is_open]
@@ -266,17 +277,15 @@ async def cameras_discover(
 
 @app.get("/cameras/config")
 def get_camera_config(
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     return {"mapping": {k: v.src for k, v in cam_mgr.sources.items()}}
 
 
 @app.post("/cameras/config")
 def set_camera_config(
-    mapping: dict = Body(..., example={"entrance": "0", "exit": "1"}),
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        mapping: dict = Body(..., example={"entrance": "0", "exit": "1"}),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     print(f"Reconfiguring cameras to: {mapping}")
     cam_mgr.reconfigure(mapping)
@@ -287,12 +296,12 @@ def set_camera_config(
 class ActiveSubjectPayload(BaseModel):
     subject_id: Optional[int] = None
 
+
 @app.post("/attendance/set_active_subject")
 def set_active_subject(
-    payload: ActiveSubjectPayload,
-    db: Session = Depends(get_db),
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        payload: ActiveSubjectPayload,
+        db: Session = Depends(get_db),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     active_user_ids: Optional[set] = None
     roster_size = 0
@@ -313,8 +322,7 @@ def set_active_subject(
 
 @app.post("/attendance/start")
 def start_attendance(
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     print("Starting AI processing for all cameras...")
     for cam in cam_mgr.sources.values(): cam.is_ai_paused = False
@@ -323,8 +331,7 @@ def start_attendance(
 
 @app.post("/attendance/stop")
 def stop_attendance(
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     print("Stopping AI processing for all cameras...")
     for cam in cam_mgr.sources.values(): cam.is_ai_paused = True
@@ -333,9 +340,8 @@ def stop_attendance(
 
 @app.get("/attendance/poll", response_model=List[dict])
 async def get_attendance_events(
-    db: Session = Depends(get_db),
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        db: Session = Depends(get_db),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     events = cam_mgr.get_attendance_events()
     if not events: return []
@@ -437,12 +443,11 @@ async def get_attendance_events(
 
 @app.get("/attendance/logs", response_model=List[dict])
 async def get_attendance_logs(
-    start_date: Optional[date] = None,
-    end_date: Optional[date] = None,
-    subject_id: Optional[int] = None,
-    db: Session = Depends(get_db),
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        subject_id: Optional[int] = None,
+        db: Session = Depends(get_db),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     query = (
         db.query(
@@ -475,13 +480,12 @@ async def get_attendance_logs(
 
 @app.get("/attendance/export")
 async def export_attendance_logs(
-    start_date: Optional[date] = None,
-    end_date: Optional[date] = None,
-    subject_id: Optional[int] = None,
-    format: str = "csv",
-    db: Session = Depends(get_db),
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        subject_id: Optional[int] = None,
+        format: str = "csv",
+        db: Session = Depends(get_db),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     query = (
         db.query(
@@ -579,9 +583,8 @@ async def export_attendance_logs(
 
 @app.post("/attendance/clear/{cam_id}")
 async def clear_attendance_log(
-    cam_id: str,
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        cam_id: str,
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     if cam_mgr.clear_attendance_session(cam_id):
         return {"message": f"Attendance session for {cam_id} cleared."}
@@ -592,9 +595,8 @@ async def clear_attendance_log(
 # --- 8. User Management & Subject Endpoints ---
 @app.get("/subjects", response_model=List[dict])
 def list_subjects(
-    db: Session = Depends(get_db),
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        db: Session = Depends(get_db),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     subjects = db.query(Subject).filter(Subject.is_deleted == 0).all()
     return [
@@ -619,10 +621,9 @@ class SubjectCreate(BaseModel):
 
 @app.post("/subjects", response_model=dict)
 async def create_subject(
-    payload: SubjectCreate,
-    db: Session = Depends(get_db),
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        payload: SubjectCreate,
+        db: Session = Depends(get_db),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     existing_subject = db.query(Subject).filter(
         Subject.subject_name == payload.subject_name,
@@ -669,10 +670,9 @@ async def create_subject(
 
 @app.delete("/subjects/{subject_id}")
 def delete_subject(
-    subject_id: int,
-    db: Session = Depends(get_db),
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        subject_id: int,
+        db: Session = Depends(get_db),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     subject = db.query(Subject).filter(
         Subject.subject_id == subject_id,
@@ -687,10 +687,9 @@ def delete_subject(
 
 @app.get("/subjects/{subject_id}/student_count", response_model=dict)
 def get_subject_student_count(
-    subject_id: int,
-    db: Session = Depends(get_db),
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        subject_id: int,
+        db: Session = Depends(get_db),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     count = db.query(User).filter(
         User.subject_id == subject_id,
@@ -705,11 +704,10 @@ class SubjectTimeUpdate(BaseModel):
 
 @app.put("/api/subjects/{subject_id}/time", response_model=dict)
 def update_subject_time(
-    subject_id: int,
-    payload: SubjectTimeUpdate,
-    db: Session = Depends(get_db),
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        subject_id: int,
+        payload: SubjectTimeUpdate,
+        db: Session = Depends(get_db),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     subject = db.query(Subject).filter(Subject.subject_id == subject_id).first()
     if not subject:
@@ -744,10 +742,9 @@ class UserUpdate(BaseModel):
 
 @app.post("/users")
 def create_user(
-    payload: UserCreate,
-    db: Session = Depends(get_db),
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        payload: UserCreate,
+        db: Session = Depends(get_db),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     if payload.role not in ["admin", "operator", "viewer"]:
         raise HTTPException(status_code=400, detail="Invalid role")
@@ -772,10 +769,9 @@ def create_user(
 
 @app.get("/users", response_model=List[dict])
 def list_users(
-    subject_id: Optional[int] = None,
-    db: Session = Depends(get_db),
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        subject_id: Optional[int] = None,
+        db: Session = Depends(get_db),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     query = db.query(User).options(selectinload(User.faces)).filter(User.is_deleted == 0)
     if subject_id is not None:
@@ -795,11 +791,10 @@ def list_users(
 
 @app.put("/users/{user_id}")
 def update_user(
-    user_id: int,
-    payload: UserUpdate,
-    db: Session = Depends(get_db),
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        user_id: int,
+        payload: UserUpdate,
+        db: Session = Depends(get_db),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     user = db.query(User).filter(User.user_id == user_id, User.is_deleted == 0).first()
     if not user:
@@ -825,10 +820,9 @@ def update_user(
 
 @app.delete("/users/{user_id}")
 def delete_user(
-    user_id: int,
-    db: Session = Depends(get_db),
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        user_id: int,
+        db: Session = Depends(get_db),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     user = db.query(User).options(selectinload(User.faces)).filter(User.user_id == user_id,
                                                                    User.is_deleted == 0).first()
@@ -845,7 +839,6 @@ def delete_user(
         db.rollback();
         raise HTTPException(status_code=500, detail=f"Failed to delete user data: {e}")
     try:
-        # ✨ [แก้ไข] เรียกใช้ Helper
         _internal_train_refresh(db)
     except Exception as e:
         print(f"Warning: _internal_train_refresh failed after deleting user: {e}")
@@ -854,10 +847,9 @@ def delete_user(
 
 @app.delete("/faces/{face_id}")
 def delete_face(
-    face_id: int,
-    db: Session = Depends(get_db),
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        face_id: int,
+        db: Session = Depends(get_db),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     face = db.query(UserFace).filter(UserFace.face_id == face_id).first()
     if not face:
@@ -869,7 +861,6 @@ def delete_face(
         if os.path.exists(file_path):
             os.remove(file_path)
         try:
-            # ✨ [แก้ไข] เรียกใช้ Helper
             _internal_train_refresh(db)
         except Exception as e:
             print(f"Warning: _internal_train_refresh failed after deleting face: {e}")
@@ -881,32 +872,58 @@ def delete_face(
 
 # --- 9. Faculty Dashboard Endpoints ---
 class ISubjectResponse(BaseModel): id: str; name: str
+
+
 class ISemesterKPIs(BaseModel): totalRoster: int; avgAttendance: float; avgLateness: float; sessionsTaught: int
+
+
 class ITrendDataset(BaseModel): label: str; data: List[float]; borderColor: Optional[str] = None; fill: Optional[
     bool] = False; backgroundColor: Optional[str] = None
+
+
 class ITrendGraph(BaseModel): labels: List[str]; datasets: List[ITrendDataset]
+
+
 class IStudentLateRisk(BaseModel):
     studentId: str
     name: str
     lates_percent: float
     lates_count: int
+
+
 class IStudentAbsentRisk(BaseModel):
     studentId: str
     name: str
     absences_percent: float
     absences_count: int
+
+
 class ISemesterOverviewData(BaseModel):
     kpis: ISemesterKPIs
     trendGraph: ITrendGraph
     studentsLate: List[IStudentLateRisk]
     studentsAbsent: List[IStudentAbsentRisk]
+
+
 class ISessionKPIs(BaseModel): present: int; total: int; absent: int; late: int
+
+
 class ISummaryDonutDataset(BaseModel): data: List[int]; backgroundColor: List[str]
+
+
 class ISummaryDonut(BaseModel): labels: List[str]; datasets: List[ISummaryDonutDataset]
+
+
 class IArrivalHistogramDataset(BaseModel): label: str; data: List[float]; backgroundColor: str
+
+
 class IArrivalHistogram(BaseModel): labels: List[str]; datasets: List[IArrivalHistogramDataset]
+
+
 class ILiveDataEntry(BaseModel): studentId: str; name: str; status: str; checkIn: Optional[str] = None; checkOut: \
     Optional[str] = None; duration: Optional[str] = None
+
+
 class ISessionViewData(
     BaseModel): kpis: ISessionKPIs; summaryDonut: ISummaryDonut; arrivalHistogram: IArrivalHistogram; liveDataTable: \
     List[ILiveDataEntry]
@@ -914,11 +931,10 @@ class ISessionViewData(
 
 @app.get("/api/faculty/subjects", response_model=List[ISubjectResponse])
 def get_faculty_subjects(
-    db: Session = Depends(get_db),
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        db: Session = Depends(get_db),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
-    print(f"User '{user_claims.get('name')}' requesting subjects...") # (ตัวอย่างการใช้ user_claims)
+    print(f"User '{user_claims.get('name')}' requesting subjects...")
     try:
         subjects = db.query(Subject).filter(Subject.is_deleted == 0).order_by(Subject.academic_year.desc(),
                                                                               Subject.subject_name).all()
@@ -937,12 +953,11 @@ def get_faculty_subjects(
 
 @app.get("/api/faculty/semester-overview", response_model=ISemesterOverviewData)
 def get_semester_overview(
-    subjectId: str,
-    start_date: Optional[date] = None,
-    end_date: Optional[date] = None,
-    db: Session = Depends(get_db),
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        subjectId: str,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        db: Session = Depends(get_db),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     try:
         subject_id_int = int(subjectId)
@@ -1105,11 +1120,10 @@ def add_minutes_to_time(t: dt_time, minutes_to_add: int) -> dt_time:
 
 @app.get("/api/faculty/session-view", response_model=ISessionViewData)
 def get_session_view(
-    subjectId: str,
-    date: date,
-    db: Session = Depends(get_db),
-    # ✨ [ป้องกัน]
-    user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+        subjectId: str,
+        date: date,
+        db: Session = Depends(get_db),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
     try:
         subject_id_int = int(subjectId)

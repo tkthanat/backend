@@ -50,7 +50,6 @@ class CameraManager:
         self.checked_in_session: Dict[str, Set[str]] = {}
         self.check_in_queue = queue.Queue()
 
-        # ✨ [ 1. เพิ่ม 2 บรรทัดนี้ ] (นี่คือจุดที่ไฟล์เก่าของคุณขาดไป)
         self.active_roster: Optional[Set[int]] = None
         self.active_subject_id: Optional[int] = None
 
@@ -206,7 +205,6 @@ class CameraManager:
                         user_id = res.get("user_id")
                         if name == "Unknown" or not user_id: continue
 
-                        # (Logic ตรวจสอบ Roster)
                         if self.active_roster is not None and user_id not in self.active_roster:
                             res["display_name"] = f"{name} (Not in class)"
                             continue
@@ -291,13 +289,12 @@ class CameraManager:
                 except KeyError:
                     pass
 
-    # ✨ [ 2. แก้ไขฟังก์ชันนี้ ] (นี่คือจุดที่ไฟล์เก่าของคุณขาดไป)
     def set_active_roster(self, user_ids: Optional[Set[int]], subject_id: Optional[int]):
         """
         อัปเดต Roster (บัญชีรายชื่อ) และ Subject ID ที่กำลัง Active
         """
         self.active_roster = user_ids
-        self.active_subject_id = subject_id  # (เพิ่มบรรทัดนี้)
+        self.active_subject_id = subject_id
 
         for trackers in self.attendance_trackers.values():
             trackers.clear()
@@ -324,6 +321,15 @@ class CameraManager:
             if cam.is_open and cam.last_frame:
                 npimg = np.frombuffer(cam.last_frame, np.uint8)
                 return cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+        return None
+
+    def get_latest_frame_jpg(self) -> Optional[bytes]:
+        """
+        ดึงเฟรมล่าสุด (JPEG bytes) จากกล้องตัวใดก็ได้ที่เปิดอยู่
+        """
+        for cam in self.sources.values():
+            if cam.is_open and cam.last_frame:
+                return cam.last_frame
         return None
 
 
