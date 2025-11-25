@@ -105,10 +105,8 @@ class AttendanceLog(Base):
                                                       index=True)
     action: Mapped[str] = mapped_column(Enum("enter", "exit", name="attendance_action"), nullable=False)
 
-    # --- [ ⭐️⭐️⭐️ 1. เพิ่ม 2 คอลัมน์นี้ ⭐️⭐️⭐️ ] ---
-    log_status: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # (เช่น "Present", "Late")
-    log_rule_start_time: Mapped[Optional[dt_time]] = mapped_column(Time, nullable=True)  # (เช่น 09:00:00)
-    # ---
+    log_status: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    log_rule_start_time: Mapped[Optional[dt_time]] = mapped_column(Time, nullable=True)
 
     timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     confidence: Mapped[Optional[float]] = mapped_column(Float)

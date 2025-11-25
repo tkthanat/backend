@@ -5,13 +5,8 @@ from fastapi.security import OAuth2PasswordBearer
 from jose import jwt, JWTError
 from typing import Dict, Any
 
-# --- (ID ของคุณ ถูกต้องแล้ว) ---
 TENANT_ID = "0ecb7c82-1b84-4b36-adef-2081b5c1125b"
 CLIENT_ID = "af39ad67-ec03-4cbd-88f3-762dd7a58dfe"
-
-# (เราไม่จำเป็นต้องใช้ AUDIENCE_ID ที่นี่)
-# AUDIENCE_ID = "api://af39ad67-ec03-4cbd-88f3-762dd7a58dfe"
-# ---
 
 AUTH_ISSUER = f"https://login.microsoftonline.com/{TENANT_ID}/v2.0"
 JWKS_URL = f"https://login.microsoftonline.com/{TENANT_ID}/discovery/v2.0/keys"
@@ -76,13 +71,11 @@ async def get_token_claims(token: str = Depends(oauth2_scheme)) -> Dict[str, Any
             )
 
     try:
+        # Validate against CLIENT_ID, not AUDIENCE_ID
         payload = jwt.decode(
             token,
             rsa_key_data,
             algorithms=["RS256"],
-            # ✨ [นี่คือจุดแก้ไขที่สำคัญที่สุด] ✨
-            # เราต้องตรวจสอบกับ CLIENT_ID (af39...)
-            # ไม่ใช่ AUDIENCE_ID (api://af39...)
             audience=CLIENT_ID,
             issuer=AUTH_ISSUER
         )

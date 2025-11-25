@@ -4,7 +4,7 @@ from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconn
     Body
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql import func
 from sqlalchemy import or_
@@ -32,13 +32,13 @@ app = FastAPI(title="Offline Attendance (Minimal)")
 COOLDOWN_SECONDS = 20
 LOCAL_TIME_OFFSET_HOURS = 7  # UTC+7 for Bangkok/Thailand
 
-# --- 1. CORS Middleware ---
+# --- CORS Middleware ---
 origins = ["http://localhost:3000", ]
 app.add_middleware(
     CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-# --- 2. Mount Static Directories ---
+# --- Mount Static Directories ---
 MEDIA_ROOT = os.getenv("MEDIA_ROOT", "./data/faces/train")
 SNAPSHOTS_DIR = "media/snapshot"
 os.makedirs(MEDIA_ROOT, exist_ok=True)
@@ -46,7 +46,7 @@ os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory="data"), name="static")
 app.mount("/media/snapshot", StaticFiles(directory=SNAPSHOTS_DIR), name="static_snapshots")
 
-# --- 3. Camera Manager Setup (เหมือนเดิม) ---
+# --- Camera Manager Setup ---
 print("Discovering local devices for initial setup...")
 discovered_devices = discover_local_devices(test_frame=False)
 available_sources = [d['src'] for d in discovered_devices if d.get('opened', False)]
@@ -70,7 +70,7 @@ async def _startup():
     print(f"[facebank] loaded users={cnt}")
 
 
-# --- 4. Internal Helper Function ---
+# --- Internal Helper Function ---
 def _internal_train_refresh(db: Session):
     """Helper function to run the training logic."""
     print("Running internal train refresh...")
@@ -84,7 +84,7 @@ def _internal_train_refresh(db: Session):
     return {"message": "facebank updated", "users": users, "images_used": total, "loaded": cnt}
 
 
-# --- 5. Face Upload & Training Endpoints ---
+# --- Face Upload & Training Endpoints ---
 @app.post("/faces/upload")
 async def upload_faces(
         user_id: int = Form(...),
@@ -117,7 +117,7 @@ def train_refresh(
     return _internal_train_refresh(db)
 
 
-# --- 6. Camera Control & Stream Endpoints ---
+# --- Camera Control & Stream Endpoints ---
 @app.get("/cameras")
 def list_cameras(
         user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
@@ -152,7 +152,6 @@ def camera_snapshot(
     return Response(content=jpg, media_type="image/jpeg")
 
 
-# --- ✨ [ใหม่] 7.1. Endpoint สำหรับถ่ายภาพจากกล้องที่เปิดอยู่ ---
 @app.get("/cameras/capture_latest_frame", responses={200: {"content": {"image/jpeg": {}}}})
 def capture_latest_frame(
         user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
@@ -171,7 +170,7 @@ def capture_latest_frame(
     return Response(content=frame_jpg, media_type="image/jpeg")
 
 
-# --- (เว้นไว้: mjpeg, ws_camera, ws_ai_results ไม่ต้องป้องกัน) ---
+# --- Public Stream Endpoints (MJPEG/WS) ---
 @app.get("/cameras/{cam_id}/mjpeg")
 def camera_mjpeg(cam_id: str):
     boundary = "frame"
@@ -259,9 +258,6 @@ async def ws_ai_results(ws: WebSocket, cam_id: str):
         print(f"[WS AI {cam_id}] Connection closed.")
 
 
-# --- (สิ้นสุดส่วนที่ไม่ต้องป้องกัน) ---
-
-
 @app.get("/cameras/discover")
 async def cameras_discover(
         max_index: int = 10,
@@ -293,7 +289,7 @@ def set_camera_config(
     return {"message": "camera mapping updated", "mapping": mapping}
 
 
-# --- 7. Attendance API Endpoints ---
+# --- Attendance API Endpoints ---
 class ActiveSubjectPayload(BaseModel):
     subject_id: Optional[int] = None
 
@@ -374,10 +370,7 @@ async def get_attendance_events(
             AttendanceLog.user_id == user_id
         ).order_by(AttendanceLog.timestamp.desc()).first()
 
-        # -----------------------------------------------
-        # ✨ [แก้ไข] Logic การตรวจสอบ Log (บังคับให้สลับสถานะ)
-        # -----------------------------------------------
-
+        # Logic: Check Log Action State
         can_log = False
         time_since_last_log = timedelta(days=1)
         if last_log:
@@ -386,31 +379,29 @@ async def get_attendance_events(
         event_action = event["action"].lower()
 
         if not last_log:
-            # 1. ถ้าไม่เคยมี Log มาก่อน: ต้องเป็น 'enter' เท่านั้น
+            # 1. First time log: must be 'enter'
             if event_action == "enter":
                 can_log = True
 
         elif event_action == "enter":
-            # 2. ถ้า Log ใหม่คือ 'enter'
+            # 2. New log is 'enter'
             if last_log.action.lower() == "exit":
-                # A. Log ล่าสุดคือ 'exit' -> ต้องเข้าได้ (Check-in ใหม่)
+                # Previous was 'exit' -> allow new Check-in
                 can_log = True
             elif last_log.action.lower() == "enter":
-                # B. Log ล่าสุดคือ 'enter' (เช็คซ้ำ) -> อนุญาตให้อัปเดตเฉพาะถ้าเกิน Cooldown
+                # Previous was 'enter' -> allow only if cooldown passed
                 if time_since_last_log >= timedelta(seconds=COOLDOWN_SECONDS):
                     can_log = True
 
         elif event_action == "exit":
-            # 3. ถ้า Log ใหม่คือ 'exit'
+            # 3. New log is 'exit'
             if last_log.action.lower() == "enter":
-                # A. Log ล่าสุดคือ 'enter' -> ต้องออกได้ (Check-out)
+                # Previous was 'enter' -> allow Check-out
                 can_log = True
             elif last_log.action.lower() == "exit":
-                # B. Log ล่าสุดคือ 'exit' (ออกซ้ำ) -> อนุญาตให้อัปเดตเฉพาะถ้าเกิน Cooldown
+                # Previous was 'exit' -> allow only if cooldown passed
                 if time_since_last_log >= timedelta(seconds=COOLDOWN_SECONDS):
                     can_log = True
-
-        # -----------------------------------------------
 
         if can_log:
             log_status: Optional[str] = None
@@ -419,11 +410,19 @@ async def get_attendance_events(
                 log_status = "Present"
                 log_rule = active_rule_time
                 if log_rule:
-                    # ✨ [แก้ไข Timezone] ปรับ Log Time (+7 ชม.) ให้เป็น Local Time ก่อนเปรียบเทียบกับ Rule Time
+                    # Compare using Local Time (+7 hours)
+
+                    # 1. Convert Log Time (UTC) to Local Time
                     local_event_timestamp = event_timestamp + timedelta(hours=LOCAL_TIME_OFFSET_HOURS)
+
+                    # 2. Create Class Start Datetime (UTC) using log date
                     class_start_dt = datetime.combine(event_timestamp.date(), log_rule)
 
-                    if local_event_timestamp > class_start_dt:
+                    # 3. Convert Class Start Datetime to Local Time
+                    class_start_dt_local = class_start_dt + timedelta(hours=LOCAL_TIME_OFFSET_HOURS)
+
+                    # 4. Compare
+                    if local_event_timestamp > class_start_dt_local:
                         log_status = "Late"
 
             new_log_db = AttendanceLog(
@@ -482,7 +481,10 @@ async def get_attendance_logs(
         .outerjoin(Subject, AttendanceLog.subject_id == Subject.subject_id)
         .order_by(AttendanceLog.timestamp.desc())
     )
+    # Filter active users and subjects
     query = query.filter(User.is_deleted != 1)
+    query = query.filter(or_(Subject.is_deleted == None, Subject.is_deleted == 0))
+
     if start_date: query = query.filter(func.date(AttendanceLog.timestamp) >= start_date)
     if end_date: query = query.filter(func.date(AttendanceLog.timestamp) <= end_date)
     if subject_id is not None: query = query.filter(AttendanceLog.subject_id == subject_id)
@@ -530,6 +532,7 @@ async def export_attendance_logs(
     )
     query = query.filter(User.is_deleted == 0)
     query = query.filter(or_(Subject.is_deleted == None, Subject.is_deleted == 0))
+
     if start_date: query = query.filter(func.date(AttendanceLog.timestamp) >= start_date)
     if end_date: query = query.filter(func.date(AttendanceLog.timestamp) <= end_date)
     if subject_id is not None: query = query.filter(AttendanceLog.subject_id == subject_id)
@@ -616,7 +619,7 @@ async def clear_attendance_log(
         raise HTTPException(status_code=404, detail=f"Camera {cam_id} not found or not open.")
 
 
-# --- 8. User Management & Subject Endpoints ---
+# --- User Management & Subject Endpoints ---
 @app.get("/subjects", response_model=List[dict])
 def list_subjects(
         db: Session = Depends(get_db),
@@ -816,7 +819,6 @@ def list_users(
 @app.put("/users/{user_id}")
 def update_user(
         user_id: int,
-        # ✨ [แก้ไข] แก้ไข NameError ให้ถูกต้อง
         payload: UserUpdate,
         db: Session = Depends(get_db),
         user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
@@ -895,7 +897,7 @@ def delete_face(
         raise HTTPException(status_code=500, detail=f"Failed to delete face: {e}")
 
 
-# --- 9. Faculty Dashboard Endpoints ---
+# --- Faculty Dashboard Endpoints ---
 class ISubjectResponse(BaseModel): id: str; name: str
 
 
@@ -1000,13 +1002,15 @@ def get_semester_overview(
             studentsAbsent=[]
         )
 
+    # Fetch first log of each user per day (Present or Late)
     first_log_subquery = (db.query(
         AttendanceLog.user_id,
         func.date(AttendanceLog.timestamp).label("log_date"),
         func.min(AttendanceLog.timestamp).label("first_timestamp")
     ).filter(
         AttendanceLog.user_id.in_(roster_map.keys()),
-        AttendanceLog.action == "enter"
+        AttendanceLog.action == "enter",
+        AttendanceLog.log_status.in_(["Present", "Late"])
     )
     )
     if start_date:
@@ -1163,6 +1167,7 @@ def get_session_view(
     roster_list = db.query(User).filter(User.subject_id == subject_id_int, User.is_deleted == 0).all()
     kpi_total = len(roster_list);
     roster_map = {u.user_id: u for u in roster_list}
+    roster_user_ids = roster_map.keys()
 
     def get_empty_histogram():
         empty_hist_labels = [f"{add_minutes_to_time(CLASS_START_TIME, (i - 2) * 5).strftime('%H:%M')}" for i in
@@ -1184,17 +1189,170 @@ def get_session_view(
     start_of_day = datetime.combine(date, dt_time.min);
     end_of_day = datetime.combine(date, dt_time.max)
 
-    # Note: โค้ดที่หายไปตรงนี้คือ Logic การสร้าง kpis, summaryDonut, arrivalHistogram, และ liveDataTable
-    # ซึ่งสร้างมาจาก log data ที่ถูกกรอง
+    # Logic for Session View
+    # 1. Get first log (enter) with status (Present/Late)
+    first_enter_log_subquery = (
+        db.query(
+            AttendanceLog.user_id,
+            func.min(AttendanceLog.timestamp).label("first_timestamp")
+        )
+        .filter(
+            AttendanceLog.user_id.in_(roster_user_ids),
+            AttendanceLog.subject_id == subject_id_int,
+            AttendanceLog.timestamp.between(start_of_day, end_of_day),
+            AttendanceLog.action == "enter",
+            AttendanceLog.log_status.in_(["Present", "Late"])
+        )
+        .group_by(AttendanceLog.user_id)
+        .subquery()
+    )
 
-    # จำลองค่าที่ควรจะได้จาก Logic ที่ขาดหายไป:
-    kpis = ISessionKPIs(present=0, total=kpi_total, absent=kpi_total, late=0)
-    summary_donut = ISummaryDonut(labels=["Present", "Late", "Absent"], datasets=[
-        ISummaryDonutDataset(data=[0, 0, kpi_total], backgroundColor=['#22c55e', '#f59e0b', '#ef4444'])])
-    arrival_histogram = get_empty_histogram()
+    logs_for_session = (
+        db.query(AttendanceLog, User.name, User.student_code)
+        .join(first_enter_log_subquery,
+              (AttendanceLog.user_id == first_enter_log_subquery.c.user_id) &
+              (AttendanceLog.timestamp == first_enter_log_subquery.c.first_timestamp))
+        .join(User, User.user_id == AttendanceLog.user_id)
+        .filter(User.is_deleted == 0)
+        .all()
+    )
+
+    # Get latest exit log
+    last_exit_logs_subquery = (
+        db.query(
+            AttendanceLog.user_id,
+            func.max(AttendanceLog.timestamp).label("last_exit_timestamp")
+        )
+        .filter(
+            AttendanceLog.user_id.in_(roster_user_ids),
+            AttendanceLog.subject_id == subject_id_int,
+            AttendanceLog.timestamp.between(start_of_day, end_of_day),
+            AttendanceLog.action == "exit"
+        )
+        .group_by(AttendanceLog.user_id)
+        .subquery()
+    )
+
+    last_exit_logs = (
+        db.query(AttendanceLog.user_id, AttendanceLog.timestamp)
+        .join(last_exit_logs_subquery,
+              (AttendanceLog.user_id == last_exit_logs_subquery.c.user_id) &
+              (AttendanceLog.timestamp == last_exit_logs_subquery.c.last_exit_timestamp))
+        .all()
+    )
+    exit_log_map = {log.user_id: log.timestamp for log in last_exit_logs}
+
+    # 2. Calculate KPI & Summary
+    present_count, late_count = 0, 0
+    attended_user_ids = set()
+    logs_by_user: Dict[int, dict] = {}
+
+    for log, name, student_code in logs_for_session:
+        attended_user_ids.add(log.user_id)
+        logs_by_user[log.user_id] = {
+            "name": name,
+            "student_code": student_code,
+            "log_status": log.log_status,
+            "timestamp": log.timestamp,
+        }
+        if log.log_status == "Present":
+            present_count += 1
+        elif log.log_status == "Late":
+            late_count += 1
+
+    absent_count = kpi_total - len(attended_user_ids)
+    kpi_present = present_count
+    kpi_late = late_count
+    kpi_absent = absent_count
+
+    # 3. Create KPI Object
+    kpis = ISessionKPIs(present=kpi_present, total=kpi_total, absent=kpi_absent, late=kpi_late)
+
+    # 4. Create Summary Donut
+    present_percent = (kpi_present / kpi_total) * 100 if kpi_total > 0 else 0
+    late_percent = (kpi_late / kpi_total) * 100 if kpi_total > 0 else 0
+    absent_percent = (kpi_absent / kpi_total) * 100 if kpi_total > 0 else 0
+
+    summary_donut = ISummaryDonut(
+        labels=[
+            f"เข้าเรียน ({kpi_present} คน, {present_percent:.1f}%)",
+            f"มาสาย ({kpi_late} คน, {late_percent:.1f}%)",
+            f"ขาด ({kpi_absent} คน, {absent_percent:.1f}%)"
+        ],
+        datasets=[
+            ISummaryDonutDataset(
+                data=[kpi_present, kpi_late, kpi_absent],
+                backgroundColor=['rgba(34, 197, 94, 0.7)', 'rgba(245, 158, 11, 0.7)', 'rgba(239, 68, 68, 0.7)']
+            )
+        ]
+    )
+
+    # 5. Create Arrival Histogram
+    histogram = get_empty_histogram()
+    bin_starts = [-10000, -10, -5, 0, 5, 10, 15, 20]
+
+    for user_id in attended_user_ids:
+        log_info = logs_by_user[user_id]
+        enter_time = log_info["timestamp"]
+        local_enter_time = enter_time + timedelta(hours=LOCAL_TIME_OFFSET_HOURS)
+        class_start_dt = datetime.combine(local_enter_time.date(), CLASS_START_TIME)
+
+        time_diff: timedelta = local_enter_time - class_start_dt
+        minutes_diff = time_diff.total_seconds() / 60
+
+        # Find Bin
+        bin_index = 0
+        for i, start_min in enumerate(bin_starts):
+            if minutes_diff >= start_min:
+                bin_index = i
+            else:
+                break
+
+        if bin_index >= len(histogram.datasets[0].data):
+            bin_index = len(histogram.datasets[0].data) - 1
+
+        histogram.datasets[0].data[bin_index] += 1
+
+    arrival_histogram = histogram
+
+    # 6. Create Live Data Table
     live_data_table: List[ILiveDataEntry] = []
 
-    # ✨ [แก้ไข] แก้ไข Syntax Error
+    all_user_statuses: Dict[int, ILiveDataEntry] = {
+        u.user_id: ILiveDataEntry(
+            studentId=u.student_code or str(u.user_id),
+            name=u.name,
+            status="Absent",
+            checkIn=None,
+            checkOut=None,
+            duration=None,
+        ) for u in roster_list
+    }
+
+    for user_id, user_info in all_user_statuses.items():
+        if user_id in logs_by_user:
+            log_info = logs_by_user[user_id]
+            enter_dt = log_info["timestamp"]
+            user_info.status = log_info["log_status"]
+            user_info.checkIn = enter_dt.isoformat()
+
+            exit_dt = exit_log_map.get(user_id)
+            if exit_dt and exit_dt > enter_dt:
+                user_info.checkOut = exit_dt.isoformat()
+                duration_minutes = round((exit_dt - enter_dt).total_seconds() / 60)
+                user_info.duration = f"{duration_minutes}"
+            elif exit_dt and exit_dt <= enter_dt:
+                user_info.checkOut = None
+                user_info.duration = None
+
+        live_data_table.append(user_info)
+
+    def sort_key(entry: ILiveDataEntry) -> Tuple[int, str]:
+        status_order = {"Present": 0, "Late": 1, "Absent": 2}
+        return status_order.get(entry.status, 3), str(entry.name)
+
+    live_data_table.sort(key=sort_key)
+
     return ISessionViewData(
         kpis=kpis,
         summaryDonut=summary_donut,
@@ -1203,7 +1361,7 @@ def get_session_view(
     )
 
 
-# --- 10. Uvicorn Runner ---
+# --- Uvicorn Runner ---
 if __name__ == "__main__":
     import uvicorn
 
