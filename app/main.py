@@ -1116,7 +1116,8 @@ class ISessionViewData(
     List[ILiveDataEntry]
 
 
-@app.get("/api/faculty/subjects", response_model=List[dict])
+# ✨ [แก้ไข Response Model] เปลี่ยนเป็น List[ISubjectResponse] เพื่อแก้ Response Validation Error
+@app.get("/api/faculty/subjects", response_model=List[ISubjectResponse])
 def get_faculty_subjects(
         db: Session = Depends(get_db),
         user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
@@ -1130,10 +1131,11 @@ def get_faculty_subjects(
             name = f"[{s.academic_year or 'N/A'}] {s.subject_name}"
             if s.section: name += f" (Sec: {s.section})"
             results.append(ISubjectResponse(id=str(s.subject_id), name=name))
-        if not results: raise HTTPException(status_code=404, detail="No subjects found. Please create a subject first.")
+
+        print("Successfully returned subjects list.")
         return results
     except Exception as e:
-        print(f"Database error in get_faculty_subjects: {e}")
+        print(f"Database error in get_faculty/subjects: {e}")
         raise HTTPException(status_code=500,
                             detail=f"Database query failed. Check if DB schema is up to date. Error: {e}")
 
