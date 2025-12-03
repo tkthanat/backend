@@ -1,4 +1,3 @@
-# app/main.py
 import cv2
 from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect, Depends, HTTPException, Response, \
     Body
@@ -11,12 +10,16 @@ from sqlalchemy import or_
 import os, io, csv, asyncio, base64, time, uuid, shutil
 from datetime import datetime, date, timedelta, time as dt_time
 from collections import defaultdict
+import re
 
 import pandas as pd
+import httpx
 
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as OpenPyXLImage
 from PIL import Image as PILImage
+
+from io import BytesIO
 
 from .db_models import get_db, UserFace, User, AttendanceLog, Subject, UserType
 from .camera_handler import CameraManager, discover_local_devices
@@ -27,18 +30,69 @@ from . import auth
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+
+def _read_roster_data_from_file(file_stream, filename: str) -> List[Dict[str, Any]]:
+    roster_list: List[Dict[str, Any]] = []
+    file_stream.seek(0)
+
+    FACE_URL_COLS = [f'face_id_{i}' for i in range(1, 10)]
+
+    def process_data(rows_of_dicts):
+        for row in rows_of_dicts:
+            def get_col_value(row, key_parts):
+                for part in key_parts:
+                    value = row.get(part.lower())
+                    if value is not None:
+                        if pd.isna(value): continue
+                        return str(value).strip()
+                return ''
+
+            code = get_col_value(row, ['student_code', 'Student_code', 'studentcode', 'รหัสนักศึกษา'])
+            name = get_col_value(row, ['name', 'Name', 'ชื่อ'])
+
+            if code and name and str(code).isdigit():
+                face_urls = []
+                for i in range(1, 10):
+                    url = get_col_value(row, [f'face_id_{i}', f'face_id{i}', f'user_faces', f'face_id_{i}'])
+                    if url and url.lower().startswith('http'):
+                        face_urls.append(url)
+
+                if len(face_urls) >= 4:
+                    roster_list.append({
+                        'student_code': str(code),
+                        'name': name,
+                        'face_urls': face_urls
+                    })
+        return roster_list
+
+    if filename.lower().endswith('.csv'):
+        content = file_stream.read().decode('utf-8')
+        reader = csv.DictReader(content.splitlines())
+        rows_of_dicts = [{k.strip().lower(): v for k, v in d.items()} for d in reader]
+        roster_list = process_data(rows_of_dicts)
+
+    elif filename.lower().endswith(('.xlsx', '.xls')):
+        try:
+            df = pd.read_excel(file_stream, engine='openpyxl')
+            df.columns = df.columns.str.lower().str.replace(r'[^a-z0-9_]', '', regex=True)
+            roster_list = process_data(df.to_dict('records'))
+        except Exception as e:
+            print(f"Error reading Excel file: {e}")
+            return []
+
+    return roster_list
+
+
 app = FastAPI(title="Offline Attendance (Minimal)")
 
 COOLDOWN_SECONDS = 20
-LOCAL_TIME_OFFSET_HOURS = 7  # UTC+7 for Bangkok/Thailand
+LOCAL_TIME_OFFSET_HOURS = 7
 
-# --- CORS Middleware ---
 origins = ["http://localhost:3000", ]
 app.add_middleware(
     CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-# --- Mount Static Directories ---
 MEDIA_ROOT = os.getenv("MEDIA_ROOT", "./data/faces/train")
 SNAPSHOTS_DIR = "media/snapshot"
 os.makedirs(MEDIA_ROOT, exist_ok=True)
@@ -46,7 +100,6 @@ os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory="data"), name="static")
 app.mount("/media/snapshot", StaticFiles(directory=SNAPSHOTS_DIR), name="static_snapshots")
 
-# --- Camera Manager Setup ---
 print("Discovering local devices for initial setup...")
 discovered_devices = discover_local_devices(test_frame=False)
 available_sources = [d['src'] for d in discovered_devices if d.get('opened', False)]
@@ -70,9 +123,7 @@ async def _startup():
     print(f"[facebank] loaded users={cnt}")
 
 
-# --- Internal Helper Function ---
 def _internal_train_refresh(db: Session):
-    """Helper function to run the training logic."""
     print("Running internal train refresh...")
     rows = (
         db.query(UserFace.user_id, UserFace.file_path, User.name)
@@ -84,7 +135,6 @@ def _internal_train_refresh(db: Session):
     return {"message": "facebank updated", "users": users, "images_used": total, "loaded": cnt}
 
 
-# --- Face Upload & Training Endpoints ---
 @app.post("/faces/upload")
 async def upload_faces(
         user_id: int = Form(...),
@@ -117,7 +167,6 @@ def train_refresh(
     return _internal_train_refresh(db)
 
 
-# --- Camera Control & Stream Endpoints ---
 @app.get("/cameras")
 def list_cameras(
         user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
@@ -156,9 +205,6 @@ def camera_snapshot(
 def capture_latest_frame(
         user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
 ):
-    """
-    ดึงเฟรมล่าสุดจากกล้องตัวใดก็ได้ที่ CameraManager กำลังสตรีมอยู่
-    """
     frame_jpg = cam_mgr.get_latest_frame_jpg()
 
     if not frame_jpg:
@@ -170,7 +216,6 @@ def capture_latest_frame(
     return Response(content=frame_jpg, media_type="image/jpeg")
 
 
-# --- Public Stream Endpoints (MJPEG/WS) ---
 @app.get("/cameras/{cam_id}/mjpeg")
 def camera_mjpeg(cam_id: str):
     boundary = "frame"
@@ -289,7 +334,6 @@ def set_camera_config(
     return {"message": "camera mapping updated", "mapping": mapping}
 
 
-# --- Attendance API Endpoints ---
 class ActiveSubjectPayload(BaseModel):
     subject_id: Optional[int] = None
 
@@ -370,7 +414,6 @@ async def get_attendance_events(
             AttendanceLog.user_id == user_id
         ).order_by(AttendanceLog.timestamp.desc()).first()
 
-        # Logic: Check Log Action State
         can_log = False
         time_since_last_log = timedelta(days=1)
         if last_log:
@@ -379,27 +422,20 @@ async def get_attendance_events(
         event_action = event["action"].lower()
 
         if not last_log:
-            # 1. First time log: must be 'enter'
             if event_action == "enter":
                 can_log = True
 
         elif event_action == "enter":
-            # 2. New log is 'enter'
             if last_log.action.lower() == "exit":
-                # Previous was 'exit' -> allow new Check-in
                 can_log = True
             elif last_log.action.lower() == "enter":
-                # Previous was 'enter' -> allow only if cooldown passed
                 if time_since_last_log >= timedelta(seconds=COOLDOWN_SECONDS):
                     can_log = True
 
         elif event_action == "exit":
-            # 3. New log is 'exit'
             if last_log.action.lower() == "enter":
-                # Previous was 'enter' -> allow Check-out
                 can_log = True
             elif last_log.action.lower() == "exit":
-                # Previous was 'exit' -> allow only if cooldown passed
                 if time_since_last_log >= timedelta(seconds=COOLDOWN_SECONDS):
                     can_log = True
 
@@ -410,18 +446,10 @@ async def get_attendance_events(
                 log_status = "Present"
                 log_rule = active_rule_time
                 if log_rule:
-                    # Compare using Local Time (+7 hours)
-
-                    # 1. Convert Log Time (UTC) to Local Time
                     local_event_timestamp = event_timestamp + timedelta(hours=LOCAL_TIME_OFFSET_HOURS)
-
-                    # 2. Create Class Start Datetime (UTC) using log date
                     class_start_dt = datetime.combine(event_timestamp.date(), log_rule)
-
-                    # 3. Convert Class Start Datetime to Local Time
                     class_start_dt_local = class_start_dt + timedelta(hours=LOCAL_TIME_OFFSET_HOURS)
 
-                    # 4. Compare
                     if local_event_timestamp > class_start_dt_local:
                         log_status = "Late"
 
@@ -481,7 +509,6 @@ async def get_attendance_logs(
         .outerjoin(Subject, AttendanceLog.subject_id == Subject.subject_id)
         .order_by(AttendanceLog.timestamp.desc())
     )
-    # Filter active users and subjects
     query = query.filter(User.is_deleted != 1)
     query = query.filter(or_(Subject.is_deleted == None, Subject.is_deleted == 0))
 
@@ -619,7 +646,6 @@ async def clear_attendance_log(
         raise HTTPException(status_code=404, detail=f"Camera {cam_id} not found or not open.")
 
 
-# --- User Management & Subject Endpoints ---
 @app.get("/subjects", response_model=List[dict])
 def list_subjects(
         db: Session = Depends(get_db),
@@ -897,7 +923,141 @@ def delete_face(
         raise HTTPException(status_code=500, detail=f"Failed to delete face: {e}")
 
 
-# --- Faculty Dashboard Endpoints ---
+@app.post("/users/import/roster")
+async def import_roster_students(
+        subject_id: int = Form(...),
+        roster_file: UploadFile = File(...),
+        db: Session = Depends(get_db),
+        user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
+):
+    if not roster_file.filename.lower().endswith(('.xlsx', '.xls', '.csv')):
+        raise HTTPException(status_code=400, detail="Only XLSX, XLS, or CSV files are supported for roster import.")
+
+    MIN_FACES_PER_STUDENT = 4
+
+    subject = db.query(Subject).filter(Subject.subject_id == subject_id, Subject.is_deleted == 0).first()
+    if not subject:
+        raise HTTPException(status_code=404, detail="Target Subject not found or is deleted.")
+
+    file_content = await roster_file.read()
+
+    try:
+        roster_list = _read_roster_data_from_file(BytesIO(file_content), roster_file.filename)
+
+        if not roster_list:
+            raise HTTPException(status_code=400,
+                                detail="Roster data is empty or invalid. Ensure columns 'student_code' and 'name' exist.")
+
+        imported_count = 0
+
+        download_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Accept": "image/*",
+        }
+
+        async with httpx.AsyncClient(timeout=60.0, headers=download_headers) as client:
+
+            for student_info in roster_list:
+                student_code = student_info['student_code']
+                name = student_info['name']
+                face_urls = student_info['face_urls']
+
+                if len(face_urls) < MIN_FACES_PER_STUDENT:
+                    raise HTTPException(status_code=400,
+                                        detail=f"Student {student_code} requires at least {MIN_FACES_PER_STUDENT} image URLs. Found {len(face_urls)}. Please ensure links are public and correct.")
+
+                user = db.query(User).filter(User.student_code == student_code, User.is_deleted == 0).first()
+
+                if user:
+                    user.name = name
+                    user.subject_id = subject_id
+                    current_user_id = user.user_id
+                else:
+                    new_user = User(student_code=student_code, name=name, role='viewer', subject_id=subject_id)
+                    db.add(new_user)
+                    db.flush()
+                    current_user_id = new_user.user_id
+
+                user_dir = os.path.join(MEDIA_ROOT, str(current_user_id))
+                os.makedirs(user_dir, exist_ok=True)
+
+                for url in face_urls:
+                    file_id = None
+                    download_url = url
+
+                    if "drive.google.com" in url or "googledrive.com" in url:
+                        match = re.search(r'(?:id=|/d/|/file/d/)([^&/?#]+)', url)
+                        if match:
+                            file_id = match.group(1)
+
+                        if file_id:
+                            file_id = file_id.split('?')[0].split('&')[0]
+
+                    if file_id:
+                        download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+                    elif url.startswith('http'):
+                        download_url = url
+                    else:
+                        continue
+
+                    try:
+                        # **การแก้ไขที่สำคัญ: บังคับให้ติดตามการ Redirect**
+                        response = await client.get(download_url, follow_redirects=True)
+                        response.raise_for_status()
+
+                        content_type = response.headers.get('Content-Type', '').lower()
+
+                        if not any(ext in content_type for ext in ['image/', 'jpeg', 'png']):
+
+                            if 'text/html' in content_type or 'text/plain' in content_type:
+                                raise HTTPException(status_code=400,
+                                                    detail=f"Failed to fetch image URL for {student_code}. Link might require login or not be a direct image file. Please check sharing permissions on Google Drive. (Tried: {download_url})")
+
+                            raise ValueError(f"Content-Type error: {content_type}")
+
+                        img_bytes = response.content
+
+                        file_ext = '.jpg'
+                        name_on_disk = f"{uuid.uuid4()}{file_ext}"
+                        dest = os.path.join(user_dir, name_on_disk)
+
+                        with open(dest, "wb") as wf:
+                            wf.write(img_bytes)
+
+                        uf = UserFace(user_id=current_user_id, file_path=name_on_disk)
+                        db.add(uf)
+
+                    except httpx.HTTPStatusError as e:
+                        print(f"HTTP Error fetching image from {download_url}: {e}")
+                        raise HTTPException(status_code=400,
+                                            detail=f"Failed to fetch image URL for {student_code}: HTTP {e.response.status_code}. Ensure link is Public/Direct. (Tried: {download_url})")
+                    except ValueError as e:
+                        print(f"Content type error for {url}: {e}")
+                        raise HTTPException(status_code=400,
+                                            detail=f"Content type error for {student_code}. Link does not point to an image.")
+                    except Exception as e:
+                        print(f"Generic Error fetching image from {download_url}: {e}")
+                        raise HTTPException(status_code=400,
+                                            detail=f"Unknown error downloading image for {student_code}.")
+
+                imported_count += 1
+
+            db.commit()
+
+            _internal_train_refresh(db)
+
+            return {
+                "message": f"Successfully imported/updated {imported_count} students and their faces by URL fetching.",
+                "students_processed": imported_count}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        print(f"Detailed import failure: {e}")
+        raise HTTPException(status_code=500, detail=f"Import failed due to an internal error: {e}")
+
+
 class ISubjectResponse(BaseModel): id: str; name: str
 
 
@@ -956,7 +1116,7 @@ class ISessionViewData(
     List[ILiveDataEntry]
 
 
-@app.get("/api/faculty/subjects", response_model=List[ISubjectResponse])
+@app.get("/api/faculty/subjects", response_model=List[dict])
 def get_faculty_subjects(
         db: Session = Depends(get_db),
         user_claims: Dict[str, Any] = Depends(auth.get_token_claims)
@@ -1002,7 +1162,6 @@ def get_semester_overview(
             studentsAbsent=[]
         )
 
-    # Fetch first log of each user per day (Present or Late)
     first_log_subquery = (db.query(
         AttendanceLog.user_id,
         func.date(AttendanceLog.timestamp).label("log_date"),
@@ -1189,8 +1348,6 @@ def get_session_view(
     start_of_day = datetime.combine(date, dt_time.min);
     end_of_day = datetime.combine(date, dt_time.max)
 
-    # Logic for Session View
-    # 1. Get first log (enter) with status (Present/Late)
     first_enter_log_subquery = (
         db.query(
             AttendanceLog.user_id,
@@ -1217,7 +1374,6 @@ def get_session_view(
         .all()
     )
 
-    # Get latest exit log
     last_exit_logs_subquery = (
         db.query(
             AttendanceLog.user_id,
@@ -1242,7 +1398,6 @@ def get_session_view(
     )
     exit_log_map = {log.user_id: log.timestamp for log in last_exit_logs}
 
-    # 2. Calculate KPI & Summary
     present_count, late_count = 0, 0
     attended_user_ids = set()
     logs_by_user: Dict[int, dict] = {}
@@ -1265,10 +1420,8 @@ def get_session_view(
     kpi_late = late_count
     kpi_absent = absent_count
 
-    # 3. Create KPI Object
     kpis = ISessionKPIs(present=kpi_present, total=kpi_total, absent=kpi_absent, late=kpi_late)
 
-    # 4. Create Summary Donut
     present_percent = (kpi_present / kpi_total) * 100 if kpi_total > 0 else 0
     late_percent = (kpi_late / kpi_total) * 100 if kpi_total > 0 else 0
     absent_percent = (kpi_absent / kpi_total) * 100 if kpi_total > 0 else 0
@@ -1287,7 +1440,6 @@ def get_session_view(
         ]
     )
 
-    # 5. Create Arrival Histogram
     histogram = get_empty_histogram()
     bin_starts = [-10000, -10, -5, 0, 5, 10, 15, 20]
 
@@ -1300,7 +1452,6 @@ def get_session_view(
         time_diff: timedelta = local_enter_time - class_start_dt
         minutes_diff = time_diff.total_seconds() / 60
 
-        # Find Bin
         bin_index = 0
         for i, start_min in enumerate(bin_starts):
             if minutes_diff >= start_min:
@@ -1315,7 +1466,6 @@ def get_session_view(
 
     arrival_histogram = histogram
 
-    # 6. Create Live Data Table
     live_data_table: List[ILiveDataEntry] = []
 
     all_user_statuses: Dict[int, ILiveDataEntry] = {
@@ -1361,7 +1511,6 @@ def get_session_view(
     )
 
 
-# --- Uvicorn Runner ---
 if __name__ == "__main__":
     import uvicorn
 
